@@ -4,10 +4,8 @@ import requests
 from datetime import datetime, timedelta, date
 from supabase import create_client, Client
 from dotenv import load_dotenv
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 import logging
-import json
 
 load_dotenv()
 
@@ -21,7 +19,6 @@ ANNUAL_API_URL = "https://api.erg.ic.ac.uk/AirQuality/Annual/MonitoringReport/Si
 HOURLY_API_URL = "https://api.erg.ic.ac.uk/AirQuality/Data/Site/SiteCode={}/StartDate={}/EndDate={}/Json"
 
 def get_supabase_client() -> Client:
-    """Initialize and return Supabase client"""
     url = os.environ.get("SUPABASE_URL")
     key = os.environ.get("SUPABASE_KEY")
     
@@ -32,19 +29,15 @@ def get_supabase_client() -> Client:
             project_ref = parts[0]
             url = f"https://{project_ref}.supabase.co"
             logger.warning("SUPABASE_URL and SUPABASE_KEY not found. Using DATABASE_URL for connection.")
-            logger.warning("For full Supabase functionality, please set SUPABASE_URL and SUPABASE_KEY")
         else:
             raise ValueError("SUPABASE_URL and SUPABASE_KEY environment variables are required")
     
     return create_client(url, key)
 
 def load_sensors(supabase: Client) -> pd.DataFrame:
-    """Load sensor configuration from Supabase sensors table"""
     logger.info("Loading sensor configuration from Supabase sensors table")
     
     try:
-        # Query active automatic sensors only (not diffusion tubes)
-        # Only automatic sensors are compatible with the UK Air Quality API
         result = supabase.table('sensors').select('*')\
             .is_('end_date', 'null')\
             .eq('sensor_type', 'Automatic')\
@@ -52,45 +45,42 @@ def load_sensors(supabase: Client) -> pd.DataFrame:
             .execute()
         
         if not result.data:
-            logger.warning("No active automatic sensors found in Supabase sensors table")
+            logger.warning("No active automatic sensors found")
             return pd.DataFrame()
         
-        # Convert to DataFrame
         df = pd.DataFrame(result.data)
-        
-        # The pollutants_measured column is already an array from Supabase
-        # No need for ast.literal_eval
-        
-        # Convert date columns
         df['start_date'] = pd.to_datetime(df['start_date'], errors='coerce')
         df['end_date'] = pd.to_datetime(df['end_date'], errors='coerce')
-        
-        # Filter out sensors without start_date
         df = df[df['start_date'].notna()]
-        
-        # Filter for valid site codes (alphabetic codes only, not pure numbers)
         df = df[df['site_code'].str.match(r'^[A-Za-z]+[0-9]*$')]
         
-        logger.info(f"Loaded {len(df)} active automatic sensors from Supabase")
+        logger.info(f"Loaded {len(df)} sensors")
         return df
     
     except Exception as e:
-        logger.error(f"Error loading sensors from Supabase: {e}")
+        logger.error(f"Error loading sensors: {e}")
         raise
 
 def get_latest_period(supabase: Client, id_site: str, pollutant: str, table: str) -> Optional[dict]:
-    """Query Supabase to find the latest complete period for a sensor-pollutant combination"""
     try:
         if table == 'annual_averages':
-            result = supabase.table(table).select('year').eq('id_site', id_site).eq('pollutant', pollutant).order('year', desc=True).limit(1).execute()
+            result = supabase.table(table).select('year')\
+                .eq('id_site', id_site).eq('pollutant', pollutant)\
+                .order('year', desc=True).limit(1).execute()
             if result.data:
                 return {'year': result.data[0]['year']}
+        
         elif table == 'monthly_averages':
-            result = supabase.table(table).select('year, month').eq('id_site', id_site).eq('pollutant', pollutant).order('year', desc=True).order('month', desc=True).limit(1).execute()
+            result = supabase.table(table).select('year, month')\
+                .eq('id_site', id_site).eq('pollutant', pollutant)\
+                .order('year', desc=True).order('month', desc=True).limit(1).execute()
             if result.data:
                 return {'year': result.data[0]['year'], 'month': result.data[0]['month']}
+        
         elif table == 'daily_averages':
-            result = supabase.table(table).select('date').eq('id_site', id_site).eq('pollutant', pollutant).order('date', desc=True).limit(1).execute()
+            result = supabase.table(table).select('date')\
+                .eq('id_site', id_site).eq('pollutant', pollutant)\
+                .order('date', desc=True).limit(1).execute()
             if result.data:
                 return {'date': result.data[0]['date']}
         
@@ -100,7 +90,6 @@ def get_latest_period(supabase: Client, id_site: str, pollutant: str, table: str
         return None
 
 def determine_missing_periods(sensor_row: pd.Series, pollutant: str, supabase: Client) -> dict:
-    """Determine which periods are missing for a sensor-pollutant combination"""
     id_site = sensor_row['id_site']
     site_code = sensor_row['site_code']
     start_date = sensor_row['start_date']
@@ -122,16 +111,11 @@ def determine_missing_periods(sensor_row: pd.Series, pollutant: str, supabase: C
     
     start_year = start_date.year
     current_year = current_date.year
-    
     last_complete_year = current_year - 1
     if current_date.month == 12 and current_date.day == 31:
         last_complete_year = current_year
     
-    if latest_annual:
-        annual_start_year = latest_annual['year'] + 1
-    else:
-        annual_start_year = start_year
-    
+    annual_start_year = latest_annual['year'] + 1 if latest_annual else start_year
     missing['annual_years'] = list(range(annual_start_year, last_complete_year + 1))
     
     if latest_monthly:
@@ -153,7 +137,6 @@ def determine_missing_periods(sensor_row: pd.Series, pollutant: str, supabase: C
         daily_start = start_date
     
     yesterday = (current_date - timedelta(days=1)).date()
-    
     day_cursor = daily_start.date() if isinstance(daily_start, pd.Timestamp) else daily_start
     while day_cursor <= yesterday:
         missing['daily_dates'].append(day_cursor)
@@ -161,8 +144,7 @@ def determine_missing_periods(sensor_row: pd.Series, pollutant: str, supabase: C
     
     return missing
 
-def fetch_annual_data(site_code: str, year: int, pollutant: str) -> Optional[dict]:
-    """Fetch annual data from UK Air Quality API"""
+def fetch_annual_data(site_code: str, year: int, api_pollutant: str) -> Optional[dict]:
     try:
         url = ANNUAL_API_URL.format(site_code, year)
         response = requests.get(url, timeout=30)
@@ -172,10 +154,8 @@ def fetch_annual_data(site_code: str, year: int, pollutant: str) -> Optional[dic
         site_report = data.get("SiteReport", {})
         report_items = site_report.get("ReportItem", [])
         
-        pollutant_code = "PM2.5" if pollutant == "PM25" else pollutant
-        
         for item in report_items:
-            if (item.get("@SpeciesCode") == pollutant_code and 
+            if (item.get("@SpeciesCode") == api_pollutant and 
                 item.get("@ReportItem") == "7" and
                 item.get("@ReportItemName", "").startswith("Mean:")):
                 
@@ -188,11 +168,10 @@ def fetch_annual_data(site_code: str, year: int, pollutant: str) -> Optional[dic
         
         return None
     except Exception as e:
-        logger.error(f"Error fetching annual data for {site_code}/{pollutant}/{year}: {e}")
+        logger.error(f"Error fetching annual data for {site_code}/{api_pollutant}/{year}: {e}")
         return None
 
-def fetch_monthly_data(site_code: str, year: int, pollutant: str) -> list:
-    """Fetch monthly data from UK Air Quality API"""
+def fetch_monthly_data(site_code: str, year: int, api_pollutant: str) -> list:
     try:
         url = ANNUAL_API_URL.format(site_code, year)
         response = requests.get(url, timeout=30)
@@ -202,10 +181,8 @@ def fetch_monthly_data(site_code: str, year: int, pollutant: str) -> list:
         site_report = data.get("SiteReport", {})
         report_items = site_report.get("ReportItem", [])
         
-        pollutant_code = "PM2.5" if pollutant == "PM25" else pollutant
-        
         for item in report_items:
-            if (item.get("@SpeciesCode") == pollutant_code and 
+            if (item.get("@SpeciesCode") == api_pollutant and 
                 item.get("@ReportItem") == "7" and
                 item.get("@ReportItemName", "").startswith("Mean:")):
                 
@@ -226,11 +203,10 @@ def fetch_monthly_data(site_code: str, year: int, pollutant: str) -> list:
         
         return []
     except Exception as e:
-        logger.error(f"Error fetching monthly data for {site_code}/{pollutant}/{year}: {e}")
+        logger.error(f"Error fetching monthly data for {site_code}/{api_pollutant}/{year}: {e}")
         return []
 
-def fetch_hourly_and_calculate_daily(site_code: str, start_date: date, end_date: date, pollutant: str) -> list:
-    """Fetch hourly data for date range and calculate daily averages for days with >=75% coverage"""
+def fetch_hourly_and_calculate_daily(site_code: str, start_date: date, end_date: date, api_pollutant: str) -> list:
     try:
         start_date_str = start_date.strftime('%Y-%m-%d')
         end_date_str = end_date.strftime('%Y-%m-%d')
@@ -246,7 +222,7 @@ def fetch_hourly_and_calculate_daily(site_code: str, start_date: date, end_date:
         
         hourly_data = []
         for item in data_items:
-            if item.get("@SpeciesCode") == pollutant:
+            if item.get("@SpeciesCode") == api_pollutant:
                 timestamp = item.get("@MeasurementDateGMT")
                 value = item.get("@Value")
                 if timestamp and value and value != "-999":
@@ -259,7 +235,7 @@ def fetch_hourly_and_calculate_daily(site_code: str, start_date: date, end_date:
                         continue
         
         if not hourly_data:
-            logger.warning(f"No hourly data found for {site_code}/{pollutant}")
+            logger.warning(f"No hourly data found for {site_code}/{api_pollutant}")
             return []
         
         df = pd.DataFrame(hourly_data)
@@ -280,11 +256,10 @@ def fetch_hourly_and_calculate_daily(site_code: str, start_date: date, end_date:
         return daily_averages
         
     except Exception as e:
-        logger.error(f"Error fetching hourly data for {site_code}/{pollutant}/{start_date} to {end_date}: {e}")
+        logger.error(f"Error fetching hourly data for {site_code}/{api_pollutant}/{start_date} to {end_date}: {e}")
         return []
 
 def upload_to_supabase(supabase: Client, table: str, records: list):
-    """Upload records to Supabase table"""
     if not records:
         return
     
@@ -296,7 +271,6 @@ def upload_to_supabase(supabase: Client, table: str, records: list):
         logger.error(f"Error uploading to {table}: {e}")
 
 def process_sensor_pollutant(sensor_row: pd.Series, pollutant: str, supabase: Client):
-    """Process a single sensor-pollutant combination"""
     logger.info(f"\n{'='*60}")
     logger.info(f"Processing {sensor_row['site_code']} ({sensor_row['id_site']}) - {pollutant}")
     logger.info(f"{'='*60}")
@@ -305,7 +279,11 @@ def process_sensor_pollutant(sensor_row: pd.Series, pollutant: str, supabase: Cl
         logger.warning(f"Skipping {sensor_row['site_code']} - {pollutant}: No start_date defined")
         return
     
-    missing = determine_missing_periods(sensor_row, pollutant, supabase)
+    # --- Correct pollutant mapping ---
+    supabase_pollutant = "PM2.5" if pollutant.upper() in ["PM25", "PM2.5"] else pollutant
+    api_pollutant = "PM25" if supabase_pollutant == "PM2.5" else supabase_pollutant
+    
+    missing = determine_missing_periods(sensor_row, supabase_pollutant, supabase)
     
     logger.info(f"Missing annual years: {missing['annual_years']}")
     logger.info(f"Missing monthly periods: {len(missing['monthly_periods'])} months")
@@ -314,11 +292,11 @@ def process_sensor_pollutant(sensor_row: pd.Series, pollutant: str, supabase: Cl
     annual_records = []
     for year in missing['annual_years']:
         logger.info(f"Fetching annual data for {year}...")
-        result = fetch_annual_data(sensor_row['site_code'], year, pollutant)
+        result = fetch_annual_data(sensor_row['site_code'], year, api_pollutant)
         if result:
             annual_records.append({
                 'id_site': sensor_row['id_site'],
-                'pollutant': pollutant,
+                'pollutant': supabase_pollutant,
                 'value': result['value'],
                 'year': year,
                 'date': f"{year}-01-01",
@@ -330,16 +308,15 @@ def process_sensor_pollutant(sensor_row: pd.Series, pollutant: str, supabase: Cl
     
     monthly_years = set(p['year'] for p in missing['monthly_periods'])
     monthly_records = []
-    
     for year in monthly_years:
         logger.info(f"Fetching monthly data for {year}...")
-        results = fetch_monthly_data(sensor_row['site_code'], year, pollutant)
+        results = fetch_monthly_data(sensor_row['site_code'], year, api_pollutant)
         for result in results:
             if any(p['year'] == result['year'] and p['month'] == result['month'] 
                    for p in missing['monthly_periods']):
                 monthly_records.append({
                     'id_site': sensor_row['id_site'],
-                    'pollutant': pollutant,
+                    'pollutant': supabase_pollutant,
                     'value': result['value'],
                     'year': result['year'],
                     'month': result['month'],
@@ -351,17 +328,12 @@ def process_sensor_pollutant(sensor_row: pd.Series, pollutant: str, supabase: Cl
         upload_to_supabase(supabase, 'monthly_averages', monthly_records)
     
     if missing['daily_dates']:
-        # Chunk into 6-month periods to avoid API timeouts
         daily_records = []
         all_dates = missing['daily_dates']
-        
         i = 0
         while i < len(all_dates):
             start_date = all_dates[i]
-            # Find end date: 6 months from start or last date in list
-            chunk_end = start_date + timedelta(days=90)  # ~6 months
-            
-            # Find the actual end index for this chunk
+            chunk_end = start_date + timedelta(days=90)
             end_idx = i
             while end_idx < len(all_dates) and all_dates[end_idx] <= chunk_end:
                 end_idx += 1
@@ -369,19 +341,15 @@ def process_sensor_pollutant(sensor_row: pd.Series, pollutant: str, supabase: Cl
             end_date = all_dates[end_idx]
             
             logger.info(f"Fetching chunk: {start_date} to {end_date} ({end_idx - i + 1} days)")
-            
             daily_results = fetch_hourly_and_calculate_daily(
-                sensor_row['site_code'], 
-                start_date, 
-                end_date, 
-                pollutant
+                sensor_row['site_code'], start_date, end_date, api_pollutant
             )
             
             for result in daily_results:
                 result_date = result['date']
                 daily_records.append({
                     'id_site': sensor_row['id_site'],
-                    'pollutant': pollutant,
+                    'pollutant': supabase_pollutant,
                     'value': result['value'],
                     'year': result_date.year,
                     'month': result_date.month,
@@ -395,15 +363,14 @@ def process_sensor_pollutant(sensor_row: pd.Series, pollutant: str, supabase: Cl
         if daily_records:
             upload_to_supabase(supabase, 'daily_averages', daily_records)
     
-    logger.info(f"Completed processing {sensor_row['site_code']} - {pollutant}")
+    logger.info(f"Completed processing {sensor_row['site_code']} - {supabase_pollutant}")
 
 def main():
-    """Main pipeline execution"""
     logger.info("Starting Air Quality Data Pipeline")
     
     try:
         supabase = get_supabase_client()
-        logger.info("Successfully connected to Supabase")
+        logger.info("Connected to Supabase")
     except Exception as e:
         logger.error(f"Failed to connect to Supabase: {e}")
         return
@@ -415,8 +382,7 @@ def main():
         pollutants = sensor['pollutants_measured']
         if isinstance(pollutants, list):
             for pollutant in pollutants:
-                pollutant = pollutant.replace('.', '')
-                tasks.append((sensor, pollutant))
+                tasks.append((sensor, pollutant.replace('.', '')))
     
     logger.info(f"Total tasks to process: {len(tasks)}")
     
