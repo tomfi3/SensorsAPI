@@ -359,7 +359,7 @@ def process_sensor_pollutant(sensor_row: pd.Series, pollutant: str, supabase: Cl
         while i < len(all_dates):
             start_date = all_dates[i]
             # Find end date: 6 months from start or last date in list
-            chunk_end = start_date + timedelta(days=180)  # ~6 months
+            chunk_end = start_date + timedelta(days=90)  # ~6 months
             
             # Find the actual end index for this chunk
             end_idx = i
