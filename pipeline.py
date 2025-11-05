@@ -246,7 +246,7 @@ def process_sensor_pollutant(sensor_row: pd.Series, pollutant: str, supabase: Cl
     monthly_result = supabase.table('monthly_averages')\
         .select('year, month')\
         .eq('id_site', sensor_row['id_site']).eq('pollutant', pollutant)\
-        .order('year', asc=True).order('month', asc=True).limit(1).execute()
+        .order('year', desc=False).order('month', desc=False)
     
     if monthly_result.data:
         first_month = monthly_result.data[0]
