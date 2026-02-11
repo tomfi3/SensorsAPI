@@ -21,15 +21,15 @@ Usage:
 """
 
 import os
-import sys
-import codecs
-import argparse
 import asyncio
-import math
+import aiohttp
+import pandas as pd
+import requests
 from datetime import datetime, timedelta
 from typing import Optional
 from collections import defaultdict
 import logging
+import re
 
 import aiohttp
 import requests
@@ -46,157 +46,232 @@ if sys.platform == "win32":
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# ── Environment ───────────────────────────────────────────────────────────────
+# API endpoints
+ANNUAL_API_URL = "https://api.erg.ic.ac.uk/AirQuality/Annual/MonitoringReport/SiteCode={}/Year={}/json"
+HOURLY_API_URL = "https://api.erg.ic.ac.uk/AirQuality/Data/Site/SiteCode={}/StartDate={}/EndDate={}/Json"
+SITES_API_URL = "https://api.erg.ic.ac.uk/AirQuality/Information/MonitoringSiteSpecies/GroupName=London/Json"
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
-
-# ── API Configuration ─────────────────────────────────────────────────────────
-
-API_BASE = "https://api.erg.ic.ac.uk/AirQuality"
-SITE_SPECIES_URL = f"{API_BASE}/Information/MonitoringSiteSpecies/GroupName=London/Json"
-
-# Tuning knobs (configurable via env)
-API_CONCURRENCY = int(os.environ.get("API_CONCURRENCY", "20"))
-DB_CONCURRENCY = int(os.environ.get("DB_CONCURRENCY", "5"))
-TASK_CONCURRENCY = int(os.environ.get("TASK_CONCURRENCY", "30"))
-INSERT_BATCH_SIZE = int(os.environ.get("INSERT_BATCH_SIZE", "200"))
-MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "4"))
-MAX_DAYS_PER_CHUNK = 365
-
-# Species we track (API code -> DB pollutant name)
-SPECIES_MAP = {
-    "NO2": "NO2",
-    "PM25": "PM2.5",
-    "PM10": "PM10",
-    "O3": "O3",
-}
-
-# Borough name -> 2-letter code for ID generation
-BOROUGH_CODE = {
-    "Barking and Dagenham": "BG",
-    "Barnet": "BN",
-    "Bexley": "BX",
-    "Brent": "BR",
-    "Bromley": "BM",
-    "Camden": "CD",
-    "City of London": "CT",
-    "Corporation of London": "CT",
-    "Croydon": "CR",
-    "Ealing": "EA",
-    "Enfield": "EN",
-    "Greenwich": "GR",
-    "Hackney": "HK",
-    "Hammersmith and Fulham": "HF",
-    "Haringey": "HR",
-    "Harrow": "HW",
-    "Havering": "HV",
-    "Hillingdon": "HI",
-    "Hounslow": "HO",
-    "Islington": "IS",
-    "Kensington and Chelsea": "KC",
-    "Kingston upon Thames": "KT",
-    "Kingston": "KT",
-    "Lambeth": "LB",
-    "Lewisham": "LW",
-    "Merton": "ME",
-    "Newham": "NM",
-    "Redbridge": "RB",
-    "Richmond": "RI",
-    "Richmond upon Thames": "RI",
-    "Southwark": "SK",
-    "Sutton": "ST",
-    "Tower Hamlets": "TH",
-    "Waltham Forest": "WF",
-    "Wandsworth": "WA",
-    "Westminster": "WM",
-}
+# Configurable via env
+MAX_CONCURRENT_REQUESTS = int(os.environ.get("MAX_CONCURRENT_REQUESTS", "20"))
+API_CALL_DELAY = float(os.environ.get("API_CALL_DELAY", "0.2"))
+HTTP_MAX_RETRIES = int(os.environ.get("HTTP_MAX_RETRIES", "3"))
+BATCH_SIZE = 500
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+def get_supabase_client() -> Client:
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_KEY")
 
-def get_borough_code(borough: str, site_code: str) -> str:
-    return BOROUGH_CODE.get(borough, site_code[:2].upper())
+    if not url or not key:
+        database_url = os.environ.get("DATABASE_URL")
+        if database_url and "supabase" in database_url:
+            parts = database_url.split("@")[1].split(".")
+            project_ref = parts[0]
+            url = f"https://{project_ref}.supabase.co"
+            logger.warning("SUPABASE_URL and SUPABASE_KEY not found. Using DATABASE_URL for connection.")
+        else:
+            raise ValueError("SUPABASE_URL and SUPABASE_KEY environment variables are required")
 
-
-def generate_ids(site_code: str, borough: str) -> tuple[str, str]:
-    code = get_borough_code(borough, site_code)
-    sc = site_code.upper()
-    return (f"{code}AA0{sc}", f"X{code}AA{sc}")
-
-
-def clean_site_name(raw: str, borough: str) -> str:
-    for prefix in [f"{borough} - ", f"{borough} -", "- "]:
-        if raw.startswith(prefix):
-            return raw[len(prefix):].strip()
-    return raw.strip()
+    return create_client(url, key)
 
 
-def normalise_species(species) -> list[dict]:
-    """Handle the XML-to-JSON quirk: single dict vs list of dicts."""
-    if isinstance(species, list):
-        return species
-    if isinstance(species, dict):
-        return [species]
-    return []
-
-
-def parse_api_date(raw: Optional[str]) -> Optional[str]:
-    if not raw or raw.strip() == "":
+def _parse_date(date_str: str) -> Optional[datetime]:
+    """Parse a date string from the API, returning None if empty/invalid."""
+    if not date_str or not date_str.strip():
         return None
     try:
-        dt = datetime.strptime(raw.strip(), "%Y-%m-%d %H:%M:%S")
-        return dt.strftime("%Y-%m-%d")
-    except ValueError:
-        pass
+        return datetime.strptime(date_str.strip().split('.')[0], '%Y-%m-%d %H:%M:%S')
+    except (ValueError, IndexError):
+        try:
+            return datetime.strptime(date_str.strip()[:10], '%Y-%m-%d')
+        except ValueError:
+            return None
+
+
+def discover_and_sync_sensors(supabase: Client) -> None:
+    """Discover all London sensors from the API and sync to Supabase."""
+    logger.info("Starting sensor discovery from London Air API")
+
     try:
-        dt = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
-        return dt.strftime("%Y-%m-%d")
-    except (ValueError, TypeError):
-        return None
+        response = requests.get(SITES_API_URL, timeout=60)
+        response.raise_for_status()
+        data = response.json()
+    except Exception as e:
+        logger.error(f"Failed to fetch sensor list from API: {e}")
+        return
+
+    raw_sites = data.get("Sites", {}).get("Site", [])
+    if not raw_sites:
+        logger.warning("No sites returned from API")
+        return
+
+    # Merge duplicate site entries (API returns same SiteCode multiple times)
+    sites_by_code = {}
+    for site in raw_sites:
+        code = site.get("@SiteCode", "")
+        if not code:
+            continue
+        if code in sites_by_code:
+            existing = sites_by_code[code]
+            new_species = site.get("Species", [])
+            if isinstance(new_species, dict):
+                new_species = [new_species]
+            existing["_species_list"].extend(new_species)
+        else:
+            species = site.get("Species", [])
+            if isinstance(species, dict):
+                species = [species]
+            site["_species_list"] = list(species)
+            sites_by_code[code] = site
+
+    logger.info(f"API returned {len(raw_sites)} entries, {len(sites_by_code)} unique sites")
+
+    # Query existing sensors from DB
+    try:
+        existing = supabase.table('sensors').select(
+            'site_code, id_installation, pollutants_measured, borough, end_date'
+        ).execute()
+        existing_map = {row['site_code']: row for row in existing.data}
+    except Exception as e:
+        logger.error(f"Failed to query existing sensors: {e}")
+        existing_map = {}
+
+    # Build borough prefix map from existing sensors
+    borough_prefix_map = {}
+    for row in existing_map.values():
+        if row.get('borough') and row.get('id_installation'):
+            id_inst = row['id_installation']
+            if 'AA0' in id_inst:
+                prefix = id_inst.split('AA0')[0]
+                borough_prefix_map[row['borough']] = prefix
+
+    n_created = 0
+    n_updated = 0
+    n_skipped = 0
+
+    for site_code, site in sites_by_code.items():
+        # Validate site_code
+        if not re.match(r'^[A-Za-z]+[0-9]*$', site_code):
+            n_skipped += 1
+            continue
+
+        site_name = site.get("@SiteName", "")
+        borough = site.get("@LocalAuthorityName", "")
+        lat_str = site.get("@Latitude", "")
+        lon_str = site.get("@Longitude", "")
+        date_opened = site.get("@DateOpened", "")
+        date_closed = site.get("@DateClosed", "")
+
+        # Parse coordinates
+        try:
+            lat = float(lat_str) if lat_str and lat_str.strip() else None
+        except (ValueError, TypeError):
+            lat = None
+        try:
+            lon = float(lon_str) if lon_str and lon_str.strip() else None
+        except (ValueError, TypeError):
+            lon = None
+
+        # Parse dates
+        start_date = _parse_date(date_opened)
+        end_date = _parse_date(date_closed)
+
+        # Build deduplicated pollutants list
+        species_list = site.get("_species_list", [])
+        api_pollutants = list(set(
+            s.get("@SpeciesCode", "") for s in species_list if s.get("@SpeciesCode")
+        ))
+        api_pollutants.sort()
+
+        if not api_pollutants:
+            n_skipped += 1
+            continue
+
+        start_date_str = start_date.strftime('%Y-%m-%d') if start_date else None
+        end_date_str = end_date.strftime('%Y-%m-%d') if end_date else None
+
+        if site_code in existing_map:
+            # Site exists — check if pollutants or end_date need updating
+            existing_row = existing_map[site_code]
+            existing_pollutants = existing_row.get('pollutants_measured') or []
+            updates = {}
+
+            # Merge pollutants
+            merged = sorted(set(existing_pollutants + api_pollutants))
+            if merged != sorted(existing_pollutants):
+                updates['pollutants_measured'] = merged
+
+            # Update end_date if changed
+            existing_end = existing_row.get('end_date')
+            if end_date_str != existing_end:
+                updates['end_date'] = end_date_str
+
+            if updates:
+                try:
+                    supabase.table('sensors').update(updates).eq(
+                        'site_code', site_code
+                    ).execute()
+                    n_updated += 1
+                except Exception as e:
+                    logger.error(f"Failed to update sensor {site_code}: {e}")
+        else:
+            # New site — determine IDs and insert
+            if borough in borough_prefix_map:
+                prefix = borough_prefix_map[borough]
+            else:
+                prefix = site_code[:2].upper()
+                borough_prefix_map[borough] = prefix
+
+            id_installation = f"{prefix}AA0{site_code}"
+            id_site = f"X{prefix}AA{site_code}"
+
+            record = {
+                'id_installation': id_installation,
+                'id_site': id_site,
+                'site_code': site_code,
+                'site_name': site_name,
+                'borough': borough,
+                'lat': lat,
+                'lon': lon,
+                'start_date': start_date_str,
+                'end_date': end_date_str,
+                'sensor_type': 'Automatic',
+                'provider': 'Automatic',
+                'pollutants_measured': api_pollutants,
+            }
+
+            try:
+                supabase.table('sensors').insert(record).execute()
+                n_created += 1
+            except Exception as e:
+                logger.error(f"Failed to insert sensor {site_code}: {e}")
+
+    logger.info(f"Sensor discovery: {n_created} created, {n_updated} updated, {n_skipped} skipped")
 
 
-def extract_pollutants(species) -> list[str]:
-    result = []
-    for sp in normalise_species(species):
-        code = sp.get("@SpeciesCode", "")
-        if code in SPECIES_MAP:
-            result.append(SPECIES_MAP[code])
-    return result
+def load_sensors(supabase: Client) -> pd.DataFrame:
+    """Load all automatic sensors from Supabase (all boroughs, active and inactive)."""
+    logger.info("Loading sensor configuration from Supabase sensors table")
+
+    result = supabase.table('sensors').select('*')\
+        .eq('sensor_type', 'Automatic')\
+        .execute()
+
+    if not result.data:
+        logger.warning("No automatic sensors found")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(result.data)
+    df['start_date'] = pd.to_datetime(df['start_date'], errors='coerce')
+    df['end_date'] = pd.to_datetime(df['end_date'], errors='coerce')
+    df = df[df['start_date'].notna()]
+    df = df[df['site_code'].str.match(r'^[A-Za-z]+[0-9]*$')]
+
+    logger.info(f"Loaded {len(df)} sensors")
+    return df
 
 
-def get_earliest_species_date(species) -> Optional[str]:
-    earliest = None
-    for sp in normalise_species(species):
-        d = parse_api_date(sp.get("@DateMeasurementStarted"))
-        if d and (earliest is None or d < earliest):
-            earliest = d
-    return earliest
-
-
-# ── Phase 1: Sync Sensors (sync, runs once) ──────────────────────────────────
-
-def fetch_site_species() -> list[dict]:
-    logger.info(f"Fetching {SITE_SPECIES_URL}")
-    resp = requests.get(SITE_SPECIES_URL, headers={"Accept": "application/json"}, timeout=60)
-    resp.raise_for_status()
-    data = resp.json()
-
-    container = data.get("Sites", data)
-    sites = container.get("Site", [])
-    if not isinstance(sites, list):
-        sites = [sites] if sites else []
-
-    logger.info(f"Retrieved {len(sites)} sites from API")
-    return sites
-
-
-def api_site_to_row(site: dict) -> Optional[dict]:
-    site_code = site.get("@SiteCode", "")
-    borough = site.get("@LocalAuthorityName", "")
-    lat_str = site.get("@Latitude", "")
-    lon_str = site.get("@Longitude", "")
-
+def get_latest_period(supabase: Client, id_site: str, pollutant: str, table: str) -> Optional[dict]:
     try:
         lat = float(lat_str)
         lon = float(lon_str)
@@ -205,554 +280,346 @@ def api_site_to_row(site: dict) -> Optional[dict]:
     if lat == 0 or lon == 0:
         return None
 
-    id_inst, id_site = generate_ids(site_code, borough)
-    start_date = get_earliest_species_date(site.get("Species", []))
-    if not start_date:
-        start_date = parse_api_date(site.get("@DateOpened"))
-    end_date = parse_api_date(site.get("@DateClosed"))
 
-    return {
-        "id_installation": id_inst,
-        "id_site": id_site,
-        "site_code": site_code,
-        "provider": "Automatic",
-        "site_name": clean_site_name(site.get("@SiteName", site_code), borough),
-        "borough": borough,
-        "lat": lat,
-        "lon": lon,
-        "sensor_type": "Automatic",
-        "pollutants_measured": extract_pollutants(site.get("Species", [])),
-        "start_date": start_date,
-        "end_date": end_date,
-    }
+def determine_missing_periods(sensor_row: pd.Series, pollutant: str, supabase: Client) -> dict:
+    id_site = sensor_row['id_site']
+    site_code = sensor_row['site_code']
+    start_date = sensor_row['start_date']
+    current_date = datetime.now()
 
+    latest_annual = get_latest_period(supabase, id_site, pollutant, 'annual_averages')
+    latest_monthly = get_latest_period(supabase, id_site, pollutant, 'monthly_averages')
+    latest_daily = get_latest_period(supabase, id_site, pollutant, 'daily_averages')
 
-def sync_sensors(supabase: Client, api_sites: list[dict], dry_run: bool) -> dict[str, dict]:
-    logger.info("Phase 1: Syncing sensors...")
+    missing = {'id_site': id_site, 'site_code': site_code, 'pollutant': pollutant,
+               'annual_years': [], 'monthly_periods': [], 'daily_dates': []}
 
-    api_rows = {}
-    skipped = []
-    for site in api_sites:
-        row = api_site_to_row(site)
-        if row:
-            api_rows[row["site_code"]] = row
-        else:
-            skipped.append(site.get("@SiteCode", "?"))
+    start_year = start_date.year
+    current_year = current_date.year
+    last_complete_year = current_year - 1
 
-    if skipped:
-        logger.info(f"Skipped {len(skipped)} sites (missing coords): {', '.join(skipped[:20])}")
-
-    logger.info("Fetching existing sensors from database...")
-    result = supabase.table("sensors").select(
-        "id_installation, id_site, site_code, pollutants_measured, end_date, start_date"
-    ).execute()
-
-    existing = {r["site_code"]: r for r in (result.data or [])}
-    logger.info(f"Existing: {len(existing)} sensors in DB | API: {len(api_rows)} sites")
-
-    to_insert = []
-    to_update = []
-    unchanged = 0
-
-    for code, row in api_rows.items():
-        ex = existing.get(code)
-        if not ex:
-            to_insert.append(row)
-        else:
-            changes = {}
-            new_poll = sorted(row.get("pollutants_measured") or [])
-            old_poll = sorted(ex.get("pollutants_measured") or [])
-            if new_poll != old_poll:
-                changes["pollutants_measured"] = row["pollutants_measured"]
-            if (row.get("end_date") or None) != (ex.get("end_date") or None):
-                changes["end_date"] = row.get("end_date")
-            if not ex.get("start_date") and row.get("start_date"):
-                changes["start_date"] = row["start_date"]
-            if changes:
-                changes["id_installation"] = ex["id_installation"]
-                to_update.append(changes)
-            else:
-                unchanged += 1
-
-    logger.info(f"New: {len(to_insert)} | Updated: {len(to_update)} | Unchanged: {unchanged}")
-
-    if dry_run:
-        for r in to_insert[:15]:
-            logger.info(f"  [DRY RUN] + {r['site_code']} -> {r['id_installation']} ({r['site_name']}, {r['borough']})")
+    if latest_annual:
+        annual_start_year = latest_annual['year'] + 1
     else:
-        if to_insert:
-            for i in range(0, len(to_insert), 100):
-                batch = to_insert[i:i + 100]
-                try:
-                    supabase.table("sensors").upsert(batch, on_conflict="id_installation").execute()
-                    logger.info(f"Inserted sensors batch {i + 1}-{min(i + 100, len(to_insert))}")
-                except Exception as e:
-                    logger.error(f"Error inserting sensors batch {i}: {e}")
-        for upd in to_update:
-            id_inst = upd.pop("id_installation")
-            try:
-                supabase.table("sensors").update(upd).eq("id_installation", id_inst).execute()
-            except Exception as e:
-                logger.error(f"Error updating sensor {id_inst}: {e}")
+        annual_start_year = start_year
+    missing['annual_years'] = list(range(annual_start_year, last_complete_year + 1))
 
-    return api_rows
+    if latest_monthly:
+        monthly_start = datetime(latest_monthly['year'], latest_monthly['month'], 1) + timedelta(days=32)
+        monthly_start = monthly_start.replace(day=1)
+    else:
+        monthly_start = start_date.replace(day=1)
 
+    last_complete_month = (current_date.replace(day=1) - timedelta(days=1)).replace(day=1)
+    month_cursor = monthly_start
+    while month_cursor <= last_complete_month:
+        missing['monthly_periods'].append({'year': month_cursor.year, 'month': month_cursor.month})
+        month_cursor = (month_cursor + timedelta(days=32)).replace(day=1)
 
-# ── Phase 2: Async Monitoring Data Engine ─────────────────────────────────────
+    if latest_daily:
+        daily_start = pd.to_datetime(latest_daily['date']) + timedelta(days=1)
+    else:
+        daily_start = start_date
+    yesterday = (current_date - timedelta(days=1)).date()
+    day_cursor = daily_start.date() if isinstance(daily_start, pd.Timestamp) else daily_start
+    while day_cursor <= yesterday:
+        missing['daily_dates'].append(day_cursor)
+        day_cursor += timedelta(days=1)
 
-def _sb_headers() -> dict:
-    return {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type": "application/json",
-        "Prefer": "return=minimal",
-    }
-
-
-def _sb_rest_url(table: str) -> str:
-    return f"{SUPABASE_URL}/rest/v1/{table}"
+    return missing
 
 
-async def sb_get_latest_hourly(
-    session: aiohttp.ClientSession, db_sem: asyncio.Semaphore,
-    id_site: str, pollutant: str,
-) -> Optional[str]:
-    """Scan year-by-year to find latest hourly record (avoids timeout on large table)."""
-    current_year = datetime.now().year
-    for year in range(current_year, current_year - 30, -1):
-        url = (
-            f"{_sb_rest_url('hourly_averages')}"
-            f"?select=year,month,day,hour"
-            f"&id_site=eq.{id_site}&pollutant=eq.{pollutant}&year=eq.{year}"
-            f"&order=month.desc,day.desc,hour.desc&limit=1"
-        )
-        async with db_sem:
-            try:
-                async with session.get(url, headers=_sb_headers()) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if data:
-                            r = data[0]
-                            return f"{r['year']}-{r['month']:02d}-{r['day']:02d} {r['hour']:02d}:00:00"
-            except Exception:
-                pass
-    return None
-
-
-async def sb_get_latest_agg(
-    session: aiohttp.ClientSession, db_sem: asyncio.Semaphore,
-    table: str, id_site: str, pollutant: str,
-) -> Optional[str]:
-    col = "date" if table != "annual_averages" else "year"
-    url = (
-        f"{_sb_rest_url(table)}"
-        f"?select={col}"
-        f"&id_site=eq.{id_site}&pollutant=eq.{pollutant}"
-        f"&order={col}.desc&limit=1"
-    )
-    async with db_sem:
-        try:
-            async with session.get(url, headers=_sb_headers()) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if data:
-                        return str(data[0][col])
-        except Exception:
-            pass
-    return None
-
-
-async def sb_insert_batch(
-    session: aiohttp.ClientSession, db_sem: asyncio.Semaphore,
-    table: str, rows: list[dict], tag: str,
-) -> int:
-    url = _sb_rest_url(table)
-    headers = _sb_headers()
-
-    for attempt in range(MAX_RETRIES):
-        async with db_sem:
-            try:
-                async with session.post(url, headers=headers, json=rows) as resp:
-                    if resp.status in (200, 201):
-                        return len(rows)
-                    body = await resp.text()
-                    if resp.status == 429:
-                        retry_after = resp.headers.get("Retry-After")
-                        wait = int(retry_after) if retry_after else (2 ** attempt + 1)
-                    else:
-                        wait = 2 ** attempt + 1
-                        if attempt == MAX_RETRIES - 1:
-                            logger.error(f"{tag}: {table} insert failed ({resp.status}) after {MAX_RETRIES} retries: {body[:200]}")
-                            return 0
-            except Exception as e:
-                wait = 2 ** attempt + 1
-                if attempt == MAX_RETRIES - 1:
-                    logger.error(f"{tag}: {table} insert exception after {MAX_RETRIES} retries: {e}")
-                    return 0
-        await asyncio.sleep(wait)
-    return 0
-
-
-async def sb_insert_rows(
-    session: aiohttp.ClientSession, db_sem: asyncio.Semaphore,
-    table: str, rows: list[dict], tag: str,
-) -> int:
-    if not rows:
-        return 0
-    inserted = 0
-    for i in range(0, len(rows), INSERT_BATCH_SIZE):
-        batch = rows[i:i + INSERT_BATCH_SIZE]
-        count = await sb_insert_batch(session, db_sem, table, batch, tag)
-        inserted += count
-    return inserted
-
-
-async def fetch_chunk_async(
-    session: aiohttp.ClientSession, api_sem: asyncio.Semaphore,
-    site_code: str, species_code: str, start: str, end: str,
-) -> list[dict]:
-    url = (
-        f"{API_BASE}/Data/SiteSpecies"
-        f"/SiteCode={site_code}/SpeciesCode={species_code}"
-        f"/StartDate={start}/EndDate={end}/Json"
-    )
-    for attempt in range(MAX_RETRIES):
-        async with api_sem:
-            try:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=90)) as resp:
-                    if resp.status == 429:
-                        retry_after = resp.headers.get("Retry-After")
-                        wait = int(retry_after) if retry_after else (2 ** attempt + 1)
-                        await asyncio.sleep(wait)
-                        continue
-                    if resp.status != 200:
-                        return []
-                    data = await resp.json(content_type=None)
-            except Exception:
-                if attempt < MAX_RETRIES - 1:
-                    await asyncio.sleep(2 ** attempt)
-                    continue
-                return []
-
-        records = (data.get("RawAQData") or data.get("AirQualityData") or {}).get("Data", [])
-        if not isinstance(records, list):
-            return []
-
-        results = []
-        for rec in records:
-            date_str = rec.get("@MeasurementDateGMT") or rec.get("@DateTime") or rec.get("@Date")
-            val_str = rec.get("@Value") or rec.get("@Concentration")
-            if not date_str or val_str is None or val_str == "":
-                continue
-            try:
-                results.append({"date": date_str, "value": float(val_str)})
-            except (ValueError, TypeError):
-                continue
-        return results
-    return []
-
-
-def generate_yearly_chunks(start_date: str, end_date: str) -> list[tuple[str, str]]:
-    start = datetime.strptime(start_date, "%Y-%m-%d")
-    end = datetime.strptime(end_date, "%Y-%m-%d")
-    chunks = []
-    cursor = start
-    while cursor < end:
-        chunk_end = min(cursor + timedelta(days=MAX_DAYS_PER_CHUNK), end)
-        chunks.append((cursor.strftime("%Y-%m-%d"), chunk_end.strftime("%Y-%m-%d")))
-        cursor = chunk_end + timedelta(days=1)
-    return chunks
-
-
-def build_work_items(
-    sensors: dict[str, dict], api_sites: list[dict],
-    site_filter: set[str] | None = None, start_override: str | None = None,
-) -> list[dict]:
-    items = []
-    end_date = datetime.now().strftime("%Y-%m-%d")
-
-    for site in api_sites:
-        site_code = site.get("@SiteCode", "")
-        if site_filter and site_code not in site_filter:
-            continue
-        sensor = sensors.get(site_code)
-        if not sensor:
-            continue
-
-        for sp in normalise_species(site.get("Species", [])):
-            api_code = sp.get("@SpeciesCode", "")
-            db_pollutant = SPECIES_MAP.get(api_code)
-            if not db_pollutant:
-                continue
-
-            species_end = parse_api_date(sp.get("@DateMeasurementFinished"))
-            if species_end:
-                continue
-
-            species_start = parse_api_date(sp.get("@DateMeasurementStarted")) or "2020-01-01"
-            if start_override and start_override > species_start:
-                species_start = start_override
-
-            items.append({
-                "id_site": sensor["id_site"],
-                "site_code": site_code,
-                "species_code": api_code,
-                "pollutant": db_pollutant,
-                "start_date": species_start,
-                "end_date": end_date,
-            })
-
-    return items
-
-
-async def process_item_async(
+async def fetch_json(
     session: aiohttp.ClientSession,
-    api_sem: asyncio.Semaphore,
-    db_sem: asyncio.Semaphore,
-    item: dict, idx: int, total: int,
-    dead_letter: list,
+    semaphore: asyncio.Semaphore,
+    url: str,
+    timeout: int = 30
 ) -> dict:
-    tag = f"[{idx + 1}/{total}] {item['site_code']}/{item['pollutant']}"
-    counts = {"hourly": 0, "daily": 0, "monthly": 0, "annual": 0}
-
-    # 1. Check latest existing hourly data (incremental)
-    latest_hourly = await sb_get_latest_hourly(session, db_sem, item["id_site"], item["pollutant"])
-
-    effective_start = item["start_date"]
-    if latest_hourly:
+    """Async HTTP GET with rate limiting and retry."""
+    last_error = None
+    for attempt in range(HTTP_MAX_RETRIES):
         try:
-            latest_dt = datetime.strptime(latest_hourly, "%Y-%m-%d %H:%M:%S")
-            incremental_start = (latest_dt + timedelta(hours=1)).strftime("%Y-%m-%d")
-            if incremental_start > item["end_date"]:
-                logger.info(f"{tag}: up to date (latest: {latest_hourly})")
-                return counts
-            effective_start = incremental_start
-            logger.info(f"{tag}: incremental from {effective_start}")
-        except ValueError:
-            pass
+            async with semaphore:
+                async with session.get(
+                    url,
+                    timeout=aiohttp.ClientTimeout(total=timeout)
+                ) as resp:
+                    resp.raise_for_status()
+                    data = await resp.json(content_type=None)
+                    await asyncio.sleep(API_CALL_DELAY)
+                    return data
+        except Exception as e:
+            last_error = e
+            if attempt < HTTP_MAX_RETRIES - 1:
+                wait = 2 ** attempt
+                logger.warning(f"Retry {attempt+1}/{HTTP_MAX_RETRIES} for {url}: {e}")
+                await asyncio.sleep(wait)
+    raise last_error
 
-    # 2. Fetch all yearly chunks concurrently
-    chunks = generate_yearly_chunks(effective_start, item["end_date"])
-    fetch_tasks = [
-        fetch_chunk_async(session, api_sem, item["site_code"], item["species_code"], cs, ce)
+
+async def fetch_annual_monthly_data(
+    session: aiohttp.ClientSession,
+    semaphore: asyncio.Semaphore,
+    site_code: str,
+    year: int,
+    pollutant: str
+) -> tuple:
+    """Fetch annual and monthly data in a single async API call."""
+    url = ANNUAL_API_URL.format(site_code, year)
+    data = await fetch_json(session, semaphore, url)
+
+    site_report = data.get("SiteReport", {})
+    report_items = site_report.get("ReportItem", [])
+    pollutant_code = "PM25" if pollutant.upper() in ["PM25", "PM2.5"] else pollutant
+
+    annual_value = None
+    monthly_results = []
+
+    for item in report_items:
+        if item.get("@SpeciesCode") == pollutant_code and item.get("@ReportItem") == "7":
+            val = item.get("@Annual")
+            if val and val != "-999":
+                try:
+                    annual_value = float(val)
+                except ValueError:
+                    pass
+            for m in range(1, 13):
+                m_val = item.get(f"@Month{m}")
+                if m_val and m_val != "-999":
+                    try:
+                        monthly_results.append({'year': year, 'month': m, 'value': float(m_val)})
+                    except ValueError:
+                        continue
+            break
+
+    return annual_value, monthly_results
+
+
+async def fetch_hourly_and_calculate_daily(
+    session: aiohttp.ClientSession,
+    semaphore: asyncio.Semaphore,
+    site_code: str,
+    start_date,
+    end_date,
+    pollutant: str
+) -> list:
+    """Fetch hourly data and calculate daily averages (min 18 readings)."""
+    start_str = start_date.strftime('%Y-%m-%d')
+    end_str = end_date.strftime('%Y-%m-%d')
+    url = HOURLY_API_URL.format(site_code, start_str, end_str)
+    data = await fetch_json(session, semaphore, url, timeout=60)
+
+    hourly_data = []
+    for item in data.get("AirQualityData", {}).get("Data", []):
+        if item.get("@SpeciesCode") == pollutant:
+            ts = item.get("@MeasurementDateGMT")
+            val = item.get("@Value")
+            if ts and val and val != "-999":
+                try:
+                    hourly_data.append({'timestamp': pd.to_datetime(ts), 'value': float(val)})
+                except (ValueError, TypeError):
+                    continue
+
+    if not hourly_data:
+        return []
+
+    df = pd.DataFrame(hourly_data)
+    df['date'] = df['timestamp'].dt.date
+
+    daily_averages = []
+    for date_val, group in df.groupby('date'):
+        if len(group) >= 18:
+            daily_averages.append({'date': date_val, 'value': group['value'].mean()})
+    return daily_averages
+
+
+def upload_to_supabase(supabase: Client, table: str, records: list):
+    """Insert records in batches to Supabase."""
+    if not records:
+        return
+    try:
+        for i in range(0, len(records), BATCH_SIZE):
+            chunk = records[i:i + BATCH_SIZE]
+            supabase.table(table).insert(chunk).execute()
+    except Exception as e:
+        logger.error(f"Error uploading {len(records)} records to {table}: {e}")
+
+
+async def process_sensor_pollutant(
+    session: aiohttp.ClientSession,
+    semaphore: asyncio.Semaphore,
+    sensor_row: pd.Series,
+    pollutant: str,
+    supabase: Client
+) -> None:
+    """Process a single sensor-pollutant pair: find gaps, fetch data, upload."""
+    site_code = sensor_row['site_code']
+    logger.info(f"Processing {site_code} - {pollutant}")
+
+    # Determine missing periods (DB queries, run in thread)
+    missing = await asyncio.to_thread(determine_missing_periods, sensor_row, pollutant, supabase)
+
+    total_missing = len(missing['annual_years']) + len(missing['monthly_periods']) + len(missing['daily_dates'])
+    if total_missing == 0:
+        logger.info(f"No missing data for {site_code} - {pollutant}")
+        return
+
+    # --- ANNUAL + MONTHLY FETCH (concurrent) ---
+    annual_records = []
+    monthly_records = []
+
+    if missing['annual_years']:
+        tasks = [
+            fetch_annual_monthly_data(session, semaphore, site_code, year, pollutant)
+            for year in missing['annual_years']
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for year, result in zip(missing['annual_years'], results):
+            if isinstance(result, Exception):
+                logger.error(f"Error fetching annual data {site_code}/{pollutant}/{year}: {result}")
+                continue
+            annual_val, monthly_vals = result
+            if annual_val is not None:
+                annual_records.append({
+                    'id_site': sensor_row['id_site'],
+                    'pollutant': pollutant,
+                    'value': annual_val,
+                    'year': year,
+                    'date': f"{year}-01-01",
+                    'averaging_period': 'annual'
+                })
+            for mv in monthly_vals:
+                if any(p['year'] == mv['year'] and p['month'] == mv['month'] for p in missing['monthly_periods']):
+                    monthly_records.append({
+                        'id_site': sensor_row['id_site'],
+                        'pollutant': pollutant,
+                        'value': mv['value'],
+                        'year': mv['year'],
+                        'month': mv['month'],
+                        'date': f"{mv['year']}-{mv['month']:02d}-01",
+                        'averaging_period': 'monthly'
+                    })
+
+    # Upload annual + monthly
+    if annual_records:
+        await asyncio.to_thread(upload_to_supabase, supabase, 'annual_averages', annual_records)
+    if monthly_records:
+        await asyncio.to_thread(upload_to_supabase, supabase, 'monthly_averages', monthly_records)
+
+    # --- DAILY FETCH ---
+    # Only fetch daily data if monthly data exists (cutoff logic)
+    monthly_result = await asyncio.to_thread(
+        lambda: supabase.table('monthly_averages')
+        .select('year, month')
+        .eq('id_site', sensor_row['id_site']).eq('pollutant', pollutant)
+        .order('year', desc=False).order('month', desc=False).limit(1).execute()
+    )
+
+    daily_dates_to_fetch = missing['daily_dates']
+    if monthly_result.data:
+        first_month = monthly_result.data[0]
+        first_month_date = datetime(first_month['year'], first_month['month'], 1)
+        daily_cutoff_start = (first_month_date - pd.DateOffset(months=2)).date()
+        daily_dates_to_fetch = [d for d in daily_dates_to_fetch if d >= daily_cutoff_start]
+
+    if not daily_dates_to_fetch:
+        logger.info(f"Completed {site_code} - {pollutant}: {len(annual_records)} annual, {len(monthly_records)} monthly, 0 daily")
+        return
+
+    # Build 90-day chunks
+    chunks = []
+    i = 0
+    while i < len(daily_dates_to_fetch):
+        chunk_start = daily_dates_to_fetch[i]
+        chunk_end_limit = chunk_start + timedelta(days=90)
+        end_idx = i
+        while end_idx < len(daily_dates_to_fetch) and daily_dates_to_fetch[end_idx] <= chunk_end_limit:
+            end_idx += 1
+        end_idx = min(end_idx, len(daily_dates_to_fetch)) - 1
+        chunk_end = daily_dates_to_fetch[end_idx]
+        chunks.append((chunk_start, chunk_end))
+        i = end_idx + 1
+
+    # Fetch all chunks concurrently
+    daily_tasks = [
+        fetch_hourly_and_calculate_daily(session, semaphore, site_code, cs, ce, pollutant)
         for cs, ce in chunks
     ]
-    chunk_results = await asyncio.gather(*fetch_tasks)
+    daily_results = await asyncio.gather(*daily_tasks, return_exceptions=True)
 
-    all_measurements = []
-    for result in chunk_results:
-        all_measurements.extend(result)
+    all_daily_records = []
+    for result in daily_results:
+        if isinstance(result, Exception):
+            logger.error(f"Error fetching daily data for {site_code}/{pollutant}: {result}")
+            continue
+        for r in result:
+            d = r['date']
+            all_daily_records.append({
+                'id_site': sensor_row['id_site'],
+                'pollutant': pollutant,
+                'value': r['value'],
+                'year': d.year,
+                'month': d.month,
+                'day': d.day,
+                'date': str(d),
+                'averaging_period': 'daily'
+            })
 
-    if not all_measurements:
-        return counts
+    # Single batch upload for all daily records
+    if all_daily_records:
+        await asyncio.to_thread(upload_to_supabase, supabase, 'daily_averages', all_daily_records)
 
-    logger.info(f"{tag}: fetched {len(all_measurements)} hourly records ({len(chunks)} chunks)")
+    logger.info(
+        f"Completed {site_code} - {pollutant}: "
+        f"{len(annual_records)} annual, {len(monthly_records)} monthly, {len(all_daily_records)} daily"
+    )
 
-    # 3. Parse, deduplicate, build rows + aggregation buckets
-    cutoff = datetime.strptime(latest_hourly, "%Y-%m-%d %H:%M:%S") if latest_hourly else None
 
-    hourly_rows = []
-    daily_bucket: dict[str, list[float]] = defaultdict(list)
-    monthly_bucket: dict[str, list[float]] = defaultdict(list)
-    annual_bucket: dict[int, list[float]] = defaultdict(list)
+async def async_pipeline(supabase: Client, sensors_df: pd.DataFrame) -> None:
+    """Async entry point: create session and launch all workers."""
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
-    for m in all_measurements:
-        try:
-            dt = datetime.strptime(m["date"], "%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            try:
-                dt = datetime.fromisoformat(m["date"].replace("Z", "+00:00"))
-                dt = dt.replace(tzinfo=None)
-            except (ValueError, TypeError):
+    async with aiohttp.ClientSession() as session:
+        tasks = []
+        for _, sensor in sensors_df.iterrows():
+            pollutants = sensor['pollutants_measured']
+            if not isinstance(pollutants, list):
                 continue
+            for pollutant in pollutants:
+                pollutant_code = pollutant.replace('.', '')
+                tasks.append(
+                    process_sensor_pollutant(session, semaphore, sensor, pollutant_code, supabase)
+                )
 
-        if cutoff and dt <= cutoff:
-            continue
+        logger.info(
+            f"Processing {len(tasks)} sensor-pollutant combinations "
+            f"with max {MAX_CONCURRENT_REQUESTS} concurrent requests"
+        )
 
-        year, month, day, hour = dt.year, dt.month, dt.day, dt.hour
-        val = m["value"]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        dt_start = dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
-        dt_end = (dt + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        succeeded = sum(1 for r in results if not isinstance(r, Exception))
+        failed = sum(1 for r in results if isinstance(r, Exception))
+        for r in results:
+            if isinstance(r, Exception):
+                logger.error(f"Worker failed: {r}")
+        logger.info(f"Pipeline complete: {succeeded} succeeded, {failed} failed")
 
-        hourly_rows.append({
-            "id_site": item["id_site"],
-            "pollutant": item["pollutant"],
-            "year": year, "month": month, "day": day, "hour": hour,
-            "value": val,
-            "datetime_start": dt_start,
-            "datetime_end": dt_end,
-        })
-
-        day_key = f"{year}-{month:02d}-{day:02d}"
-        month_key = f"{year}-{month:02d}"
-        daily_bucket[day_key].append(val)
-        monthly_bucket[month_key].append(val)
-        annual_bucket[year].append(val)
-
-    if not hourly_rows:
-        logger.info(f"{tag}: no new records after filtering")
-        return counts
-
-    # 4. Insert hourly data
-    counts["hourly"] = await sb_insert_rows(session, db_sem, "hourly_averages", hourly_rows, tag)
-
-    if counts["hourly"] < len(hourly_rows):
-        dead_letter.append({"item": tag, "table": "hourly_averages", "failed_rows": len(hourly_rows) - counts["hourly"]})
-
-    # 5. Daily averages (>= 18 hourly readings)
-    latest_daily = await sb_get_latest_agg(session, db_sem, "daily_averages", item["id_site"], item["pollutant"])
-    daily_rows = []
-    for day_key, vals in sorted(daily_bucket.items()):
-        if latest_daily and day_key <= latest_daily:
-            continue
-        if len(vals) >= 18:
-            y, mo, d = day_key.split("-")
-            daily_rows.append({
-                "id_site": item["id_site"], "pollutant": item["pollutant"],
-                "value": round(sum(vals) / len(vals), 2),
-                "year": int(y), "month": int(mo), "day": int(d),
-                "date": day_key, "averaging_period": "daily",
-            })
-    counts["daily"] = await sb_insert_rows(session, db_sem, "daily_averages", daily_rows, tag)
-
-    # 6. Monthly averages
-    latest_monthly = await sb_get_latest_agg(session, db_sem, "monthly_averages", item["id_site"], item["pollutant"])
-    monthly_rows = []
-    for month_key, vals in sorted(monthly_bucket.items()):
-        month_date = f"{month_key}-01"
-        if latest_monthly and month_date <= latest_monthly:
-            continue
-        y, mo = month_key.split("-")
-        monthly_rows.append({
-            "id_site": item["id_site"], "pollutant": item["pollutant"],
-            "value": round(sum(vals) / len(vals), 2),
-            "year": int(y), "month": int(mo),
-            "date": month_date, "averaging_period": "monthly",
-        })
-    counts["monthly"] = await sb_insert_rows(session, db_sem, "monthly_averages", monthly_rows, tag)
-
-    # 7. Annual averages (>= 75% of expected hours)
-    latest_annual = await sb_get_latest_agg(session, db_sem, "annual_averages", item["id_site"], item["pollutant"])
-    annual_rows = []
-    for year, vals in sorted(annual_bucket.items()):
-        if latest_annual and year <= int(latest_annual):
-            continue
-        is_leap = (year % 4 == 0 and (year % 100 != 0 or year % 400 == 0))
-        expected = 8784 if is_leap else 8760
-        if len(vals) >= math.floor(expected * 0.75):
-            annual_rows.append({
-                "id_site": item["id_site"], "pollutant": item["pollutant"],
-                "value": round(sum(vals) / len(vals), 2),
-                "year": year, "date": f"{year}-01-01", "averaging_period": "annual",
-            })
-    counts["annual"] = await sb_insert_rows(session, db_sem, "annual_averages", annual_rows, tag)
-
-    logger.info(f"{tag}: inserted h={counts['hourly']} d={counts['daily']} m={counts['monthly']} a={counts['annual']}")
-    return counts
-
-
-async def run_async_pipeline(items: list[dict]):
-    logger.info(f"Phase 2: Async engine | API={API_CONCURRENCY} DB={DB_CONCURRENCY} tasks={len(items)}")
-
-    api_sem = asyncio.Semaphore(API_CONCURRENCY)
-    db_sem = asyncio.Semaphore(DB_CONCURRENCY)
-    task_sem = asyncio.Semaphore(TASK_CONCURRENCY)
-    dead_letter: list[dict] = []
-    totals = {"hourly": 0, "daily": 0, "monthly": 0, "annual": 0, "errors": 0}
-
-    connector = aiohttp.TCPConnector(limit=API_CONCURRENCY + DB_CONCURRENCY + 10, ttl_dns_cache=300)
-    timeout = aiohttp.ClientTimeout(total=120, connect=30)
-
-    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        async def bounded_task(idx: int, item: dict):
-            async with task_sem:
-                try:
-                    return await process_item_async(session, api_sem, db_sem, item, idx, len(items), dead_letter)
-                except Exception as e:
-                    logger.error(f"Error [{idx + 1}/{len(items)}] {item['site_code']}/{item['pollutant']}: {e}")
-                    dead_letter.append({"item": f"{item['site_code']}/{item['pollutant']}", "error": str(e)})
-                    return None
-
-        tasks = [bounded_task(i, item) for i, item in enumerate(items)]
-        results = await asyncio.gather(*tasks)
-
-    for result in results:
-        if result:
-            for key in ("hourly", "daily", "monthly", "annual"):
-                totals[key] += result[key]
-        else:
-            totals["errors"] += 1
-
-    logger.info("=" * 50)
-    logger.info("Phase 2 Summary")
-    logger.info(f"  Hourly records:   {totals['hourly']:,}")
-    logger.info(f"  Daily averages:   {totals['daily']:,}")
-    logger.info(f"  Monthly averages: {totals['monthly']:,}")
-    logger.info(f"  Annual averages:  {totals['annual']:,}")
-    logger.info(f"  Task errors:      {totals['errors']}")
-    if dead_letter:
-        logger.warning(f"  Dead letter queue: {len(dead_letter)} entries")
-        for dl in dead_letter[:20]:
-            logger.warning(f"    - {dl}")
-    logger.info("=" * 50)
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="London Air Data Pipeline")
-    parser.add_argument("--sensors-only", action="store_true", help="Phase 1 only")
-    parser.add_argument("--data-only", action="store_true", help="Phase 2 only")
-    parser.add_argument("--dry-run", action="store_true", help="Preview without writing")
-    parser.add_argument("--sites", type=str, help="Comma-separated site codes (e.g. RI1,WA7)")
-    parser.add_argument("--start-date", type=str, help="Override start date (YYYY-MM-DD)")
-    args = parser.parse_args()
+    logger.info("Starting Air Quality Pipeline")
+    supabase = get_supabase_client()
 
-    logger.info("=" * 60)
-    logger.info("London Air Data Pipeline (async)")
-    logger.info(f"  Mode:        {'DRY RUN' if args.dry_run else 'LIVE'}")
-    logger.info(f"  Supabase:    {SUPABASE_URL}")
-    logger.info(f"  Concurrency: API={API_CONCURRENCY} DB={DB_CONCURRENCY}")
-    logger.info("=" * 60)
+    discover_and_sync_sensors(supabase)
 
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        logger.error("SUPABASE_URL and SUPABASE_KEY environment variables are required")
-        sys.exit(1)
+    sensors_df = load_sensors(supabase)
+    if sensors_df.empty:
+        logger.warning("No sensors to process")
+        return
 
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-    api_sites = fetch_site_species()
-
-    # Phase 1
-    if not args.data_only:
-        sensors = sync_sensors(supabase, api_sites, args.dry_run)
-    else:
-        sensors = {}
-        for site in api_sites:
-            row = api_site_to_row(site)
-            if row:
-                sensors[row["site_code"]] = row
-
-    # Phase 2
-    site_filter = set(args.sites.split(",")) if args.sites else None
-    if site_filter:
-        logger.info(f"Filtering to sites: {', '.join(sorted(site_filter))}")
-
-    if not args.sensors_only:
-        items = build_work_items(sensors, api_sites, site_filter, args.start_date)
-        logger.info(f"Built {len(items)} work items (sensor x pollutant)")
-
-        if args.dry_run:
-            total_chunks = sum(len(generate_yearly_chunks(i["start_date"], i["end_date"])) for i in items)
-            logger.info(f"[DRY RUN] {len(items)} items = {total_chunks} API chunks")
-            for item in items[:20]:
-                c = len(generate_yearly_chunks(item["start_date"], item["end_date"]))
-                logger.info(f"  {item['site_code']}/{item['pollutant']}: {item['start_date']} -> {item['end_date']} ({c} chunks)")
-        else:
-            asyncio.run(run_async_pipeline(items))
-
-    logger.info(f"Pipeline completed at {datetime.now().isoformat()}")
+    asyncio.run(async_pipeline(supabase, sensors_df))
+    logger.info("Pipeline completed")
 
 
 if __name__ == "__main__":
