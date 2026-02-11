@@ -32,6 +32,37 @@ record building) intact.
 
 No new files created. No schema changes.
 
+### 1.4 Key Requirements
+
+These are the three driving goals behind the rewrite — not just speed.
+
+**R1: All London sensors, including those not yet in Supabase**
+The current pipeline only processes sensors that already exist in the `sensors` table,
+filtered to 3 boroughs. Many London sensors have never been added to Supabase. The new
+pipeline must **auto-discover all automatic monitoring stations** across every London
+borough from the London Air API (`MonitoringSiteSpecies` endpoint) and create them in
+Supabase before fetching data. This means the pipeline is self-bootstrapping — it does
+not depend on sensors being manually pre-populated.
+
+**R2: Include inactive/decommissioned sensors**
+The current pipeline filters to `end_date IS NULL` (active sensors only). Historical
+sensors that have been decommissioned still have years of valuable data. The new pipeline
+must **remove the active-only filter** and backfill data for all sensors regardless of
+their operational status.
+
+**R3: All pollutants including Ozone (O3)**
+The current pipeline only processes pollutants already listed in each sensor's
+`pollutants_measured` array. O3 was not previously included for some sensors. The new
+`discover_and_sync_sensors()` function pulls the **complete species list** from the
+London Air API for every sensor — including O3, NO2, PM10, PM2.5, SO2, and any others
+the API reports. If a sensor's `pollutants_measured` array in Supabase is missing species
+that the API reports, it gets updated. The pipeline then processes **every pollutant** in
+the array — no species whitelist or blacklist.
+
+**R4: Concurrent fetching for speed**
+Wrap all API calls in `asyncio` + `aiohttp` with a semaphore-based rate limiter.
+Target: first full backfill in ~25-30 minutes instead of ~8-9 hours.
+
 ---
 
 ## 2. Current System Analysis
@@ -241,7 +272,25 @@ def discover_and_sync_sensors(supabase: Client) -> None:
    }
    ```
 
-2. **Parse each site:**
+2. **Merge duplicate site entries** (API returns same SiteCode multiple times):
+   ```python
+   sites_by_code = {}
+   for site in raw_sites:
+       code = site['@SiteCode']
+       if code in sites_by_code:
+           # Merge species from duplicate entry
+           existing_species = sites_by_code[code].setdefault('_species_list', [])
+           new_species = site.get('Species', [])
+           if isinstance(new_species, dict): new_species = [new_species]
+           existing_species.extend(new_species)
+       else:
+           species = site.get('Species', [])
+           if isinstance(species, dict): species = [species]
+           site['_species_list'] = list(species)
+           sites_by_code[code] = site
+   ```
+
+3. **Parse each merged site:**
    - `site_code` = `@SiteCode`
    - `site_name` = `@SiteName`
    - `lat` = `float(@Latitude)` or `None` if empty/invalid
@@ -249,15 +298,14 @@ def discover_and_sync_sensors(supabase: Client) -> None:
    - `start_date` = `@DateOpened` parsed as date, or `None`
    - `end_date` = `@DateClosed` parsed as date if non-empty, else `None`
    - `borough` = `@LocalAuthorityName`
-   - `pollutants_measured` = list of `@SpeciesCode` from `Species`
-     - **Edge case**: If site has exactly one species, API returns `Species` as a dict
-       instead of a list. Normalize: `if isinstance(species, dict): species = [species]`
+   - `pollutants_measured` = deduplicated list of `@SpeciesCode` from merged `_species_list`
+     - Deduplicate: `list(set(code for s in species_list for code in [s['@SpeciesCode']]))`
 
-3. **Validate site_code:**
+4. **Validate site_code:**
    - Must match `^[A-Za-z]+[0-9]*$` (letters optionally followed by digits)
    - Skip sites that don't match (some have codes like "LONDON" which aren't real sensors)
 
-4. **Query existing sensors from DB:**
+5. **Query existing sensors from DB:**
    ```python
    existing = supabase.table('sensors').select(
        'site_code, id_installation, pollutants_measured, borough'
@@ -265,7 +313,7 @@ def discover_and_sync_sensors(supabase: Client) -> None:
    existing_map = {row['site_code']: row for row in existing.data}
    ```
 
-5. **Build borough prefix map** from existing sensors:
+6. **Build borough prefix map** from existing sensors:
    ```python
    # e.g. {"Wandsworth": "WA", "Richmond": "RI", "Merton": "ME"}
    borough_prefix_map = {}
@@ -275,7 +323,7 @@ def discover_and_sync_sensors(supabase: Client) -> None:
            borough_prefix_map[row['borough']] = prefix
    ```
 
-6. **For each API site, determine action:**
+7. **For each API site, determine action:**
 
    **a) Site exists in DB** (`site_code` in `existing_map`):
    - Compare `pollutants_measured` arrays
@@ -315,7 +363,7 @@ def discover_and_sync_sensors(supabase: Client) -> None:
      }
      ```
 
-7. **Log summary:** `"Sensor discovery: {n_created} created, {n_updated} updated, {n_skipped} skipped"`
+8. **Log summary:** `"Sensor discovery: {n_created} created, {n_updated} updated, {n_skipped} skipped"`
 
 ### 4.4 `load_sensors()` — updated
 
@@ -682,23 +730,39 @@ create table public.sensors (
 
 **URL:** `https://api.erg.ic.ac.uk/AirQuality/Information/MonitoringSiteSpecies/GroupName=London/Json`
 
-**Response structure:**
+**Response structure (confirmed from live API):**
 ```json
 {
   "Sites": {
     "Site": [
       {
-        "@SiteCode": "BT1",
-        "@SiteName": "Brent - Ikea",
-        "@SiteType": "Suburban",
-        "@Latitude": "51.553",
-        "@Longitude": "-0.257",
-        "@DateOpened": "2005-01-01 00:00:00",
-        "@DateClosed": "",
+        "@LocalAuthorityCode": "4",
         "@LocalAuthorityName": "Brent",
+        "@SiteCode": "BT4",
+        "@SiteName": "Brent - Ikea",
+        "@SiteType": "Roadside",
+        "@DateClosed": "",
+        "@DateOpened": "2003-06-20 06:00:00",
+        "@Latitude": "51.552476",
+        "@Longitude": "-0.258089",
+        "@LatitudeWGS84": "6719608.36938",
+        "@LongitudeWGS84": "-28730.3360593",
+        "@DataOwner": "Brent",
+        "@DataManager": "King's College London",
+        "@SiteLink": "http://www.londonair.org.uk/...",
         "Species": [
-          {"@SpeciesCode": "NO2", "@SpeciesName": "Nitrogen Dioxide", ...},
-          {"@SpeciesCode": "PM10", "@SpeciesName": "PM10 Particulate", ...}
+          {
+            "@SpeciesCode": "NO2",
+            "@SpeciesDescription": "Nitrogen Dioxide",
+            "@DateMeasurementStarted": "2004-09-17 10:00:00",
+            "@DateMeasurementFinished": ""
+          },
+          {
+            "@SpeciesCode": "O3",
+            "@SpeciesDescription": "Ozone",
+            "@DateMeasurementStarted": "2006-05-25 10:30:00",
+            "@DateMeasurementFinished": ""
+          }
         ]
       }
     ]
@@ -706,11 +770,24 @@ create table public.sensors (
 }
 ```
 
-**Edge cases:**
-- `Species` can be a dict (single species) or list (multiple species)
+**Confirmed species codes:** NO2, O3, PM10, PM25, SO2, CO
+
+**Per-species measurement dates:** Each species has its own `@DateMeasurementStarted`
+and `@DateMeasurementFinished`, independent of the site's `@DateOpened`/`@DateClosed`.
+The pipeline can use these for smarter per-species backfill ranges.
+
+**Edge cases (confirmed from live data):**
+- `Species` can be a dict (single species) or list (multiple species) — e.g., BG3
+  returns a dict for its single NO2 species, BG1 returns a list for NO2+SO2
 - `@DateClosed` is empty string `""` for active sensors, datetime string for closed
-- `@Latitude`/`@Longitude` can be empty strings for some sensors
-- Some `@SiteCode` values are non-standard (e.g., "LONDON") — filter with regex
+- `@DateMeasurementFinished` is empty string `""` for active measurements
+- `@Latitude`/`@Longitude` can be empty strings (e.g., CTA, EG1, KG1, KG2)
+- **Duplicate site entries**: Some sites appear multiple times (e.g., HS5 appears 3×
+  with different species each time). Must merge species across all entries for same SiteCode.
+- **Duplicate species within a site**: Some sites list the same species twice (e.g., GR8
+  has PM10 twice, HG1 has NO2 twice). Must deduplicate when building pollutants list.
+- `@LocalAuthorityName` = data owner borough, not physical location (e.g., GB6 owned
+  by Bexley but named "Greenwich - Falconwood")
 
 ### 7.2 Annual/Monthly (data fetch)
 
