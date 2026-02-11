@@ -55,6 +55,7 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
 API_BASE = "https://api.erg.ic.ac.uk/AirQuality"
 SITE_SPECIES_URL = f"{API_BASE}/Information/MonitoringSiteSpecies/GroupName=London/Json"
+MONITORING_REPORT_URL = API_BASE + "/Annual/MonitoringReport/SiteCode={site_code}/Year={year}/json"
 
 # Tuning knobs (configurable via env)
 API_CONCURRENCY = int(os.environ.get("API_CONCURRENCY", "20"))
@@ -452,6 +453,105 @@ async def fetch_chunk_async(
     return []
 
 
+# Locks for deduplicating concurrent MonitoringReport fetches for the same site+year
+_report_locks: dict[tuple[str, int], asyncio.Lock] = {}
+
+
+async def fetch_monitoring_report_async(
+    session: aiohttp.ClientSession, api_sem: asyncio.Semaphore,
+    site_code: str, year: int,
+    report_cache: dict[tuple[str, int], dict],
+) -> dict[str, dict]:
+    """Fetch official annual/monthly averages from ERG MonitoringReport API.
+
+    Returns dict keyed by species code, e.g.:
+        {"NO2": {"annual": 35.2, "monthly": {1: 40.1, 2: 38.5, ...}}}
+
+    Uses report_cache to avoid duplicate API calls (same site+year returns all species).
+    """
+    cache_key = (site_code, year)
+    if cache_key in report_cache:
+        return report_cache[cache_key]
+
+    # Ensure only one coroutine fetches per (site_code, year)
+    if cache_key not in _report_locks:
+        _report_locks[cache_key] = asyncio.Lock()
+    async with _report_locks[cache_key]:
+        # Re-check after acquiring lock
+        if cache_key in report_cache:
+            return report_cache[cache_key]
+
+        url = MONITORING_REPORT_URL.format(site_code=site_code, year=year)
+        result: dict[str, dict] = {}
+
+        for attempt in range(MAX_RETRIES):
+            async with api_sem:
+                try:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=90)) as resp:
+                        if resp.status == 429:
+                            retry_after = resp.headers.get("Retry-After")
+                            wait = int(retry_after) if retry_after else (2 ** attempt + 1)
+                            await asyncio.sleep(wait)
+                            continue
+                        if resp.status != 200:
+                            report_cache[cache_key] = result
+                            return result
+                        data = await resp.json(content_type=None)
+                except Exception:
+                    if attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep(2 ** attempt)
+                        continue
+                    report_cache[cache_key] = result
+                    return result
+
+            # Parse SiteReport -> ReportItem array
+            site_report = data.get("SiteReport")
+            if not site_report:
+                # API returns {"SiteReport": null} for unknown site/year combos
+                break
+            report_items = site_report.get("ReportItem", [])
+            if isinstance(report_items, dict):
+                report_items = [report_items]
+
+            for item in report_items:
+                # Filter: ReportItem type "7" and name starts with "Mean:"
+                if item.get("@ReportItem") != "7":
+                    continue
+                item_name = item.get("@ReportItemName", "")
+                if not item_name.startswith("Mean:"):
+                    continue
+
+                species_code = item.get("@SpeciesCode", "")
+                if not species_code:
+                    continue
+
+                # Extract annual value
+                annual_val = item.get("@Annual", "")
+                annual = None
+                if annual_val and annual_val not in ("-999", ""):
+                    try:
+                        annual = float(annual_val)
+                    except (ValueError, TypeError):
+                        pass
+
+                # Extract monthly values (@Month1 through @Month12)
+                monthly: dict[int, float] = {}
+                for m in range(1, 13):
+                    mv = item.get(f"@Month{m}", "")
+                    if mv and mv not in ("-999", ""):
+                        try:
+                            monthly[m] = float(mv)
+                        except (ValueError, TypeError):
+                            pass
+
+                result[species_code] = {"annual": annual, "monthly": monthly}
+
+            break  # success, exit retry loop
+
+        report_cache[cache_key] = result
+        return result
+
+
 def generate_yearly_chunks(start_date: str, end_date: str) -> list[tuple[str, str]]:
     start = datetime.strptime(start_date, "%Y-%m-%d")
     end = datetime.strptime(end_date, "%Y-%m-%d")
@@ -493,6 +593,8 @@ def build_work_items(
             if start_override and start_override > species_start:
                 species_start = start_override
 
+            start_year = int(species_start[:4])
+
             items.append({
                 "id_site": sensor["id_site"],
                 "site_code": site_code,
@@ -500,6 +602,7 @@ def build_work_items(
                 "pollutant": db_pollutant,
                 "start_date": species_start,
                 "end_date": end_date,
+                "start_year": start_year,
             })
 
     return items
@@ -511,6 +614,7 @@ async def process_item_async(
     db_sem: asyncio.Semaphore,
     item: dict, idx: int, total: int,
     dead_letter: list,
+    report_cache: dict[tuple[str, int], dict],
 ) -> dict:
     tag = f"[{idx + 1}/{total}] {item['site_code']}/{item['pollutant']}"
     counts = {"hourly": 0, "daily": 0, "monthly": 0, "annual": 0}
@@ -616,37 +720,95 @@ async def process_item_async(
             })
     counts["daily"] = await sb_insert_rows(session, db_sem, "daily_averages", daily_rows, tag)
 
-    # 6. Monthly averages
+    # 6. Monthly & Annual averages
+    # O3 has no Mean row in MonitoringReport — fall back to computing from hourly.
+    # For NO2, PM10, PM25: use official ERG MonitoringReport values.
     latest_monthly = await sb_get_latest_agg(session, db_sem, "monthly_averages", item["id_site"], item["pollutant"])
-    monthly_rows = []
-    for month_key, vals in sorted(monthly_bucket.items()):
-        month_date = f"{month_key}-01"
-        if latest_monthly and month_date <= latest_monthly:
-            continue
-        y, mo = month_key.split("-")
-        monthly_rows.append({
-            "id_site": item["id_site"], "pollutant": item["pollutant"],
-            "value": round(sum(vals) / len(vals), 2),
-            "year": int(y), "month": int(mo),
-            "date": month_date, "averaging_period": "monthly",
-        })
-    counts["monthly"] = await sb_insert_rows(session, db_sem, "monthly_averages", monthly_rows, tag)
-
-    # 7. Annual averages (>= 75% of expected hours)
     latest_annual = await sb_get_latest_agg(session, db_sem, "annual_averages", item["id_site"], item["pollutant"])
-    annual_rows = []
-    for year, vals in sorted(annual_bucket.items()):
-        if latest_annual and year <= int(latest_annual):
-            continue
-        is_leap = (year % 4 == 0 and (year % 100 != 0 or year % 400 == 0))
-        expected = 8784 if is_leap else 8760
-        if len(vals) >= math.floor(expected * 0.75):
-            annual_rows.append({
+
+    current_year = datetime.now().year
+    start_year = item.get("start_year", current_year)
+
+    # Try MonitoringReport first (has official means for NO2, PM10, PM25 but not O3)
+    annual_from = int(latest_annual) + 1 if latest_annual else start_year
+    if latest_monthly:
+        monthly_from_year = int(latest_monthly[:4])
+    else:
+        monthly_from_year = start_year
+    fetch_from = min(annual_from, monthly_from_year)
+
+    report_tasks = [
+        fetch_monitoring_report_async(session, api_sem, item["site_code"], y, report_cache)
+        for y in range(fetch_from, current_year + 1)
+    ]
+    report_results = await asyncio.gather(*report_tasks)
+    year_reports = {y: r for y, r in zip(range(fetch_from, current_year + 1), report_results)}
+
+    # Check if MonitoringReport has Mean data for this species in any year
+    has_official_mean = any(
+        item["species_code"] in yr_data for yr_data in year_reports.values()
+    )
+
+    if has_official_mean:
+        # Use official ERG values for annual and monthly
+        annual_rows = []
+        for year in sorted(year_reports.keys()):
+            if latest_annual and year <= int(latest_annual):
+                continue
+            species_data = year_reports[year].get(item["species_code"], {})
+            annual_val = species_data.get("annual")
+            if annual_val is not None:
+                annual_rows.append({
+                    "id_site": item["id_site"], "pollutant": item["pollutant"],
+                    "value": round(annual_val, 2),
+                    "year": year, "date": f"{year}-01-01", "averaging_period": "annual",
+                })
+        counts["annual"] = await sb_insert_rows(session, db_sem, "annual_averages", annual_rows, tag)
+
+        monthly_rows = []
+        for year in sorted(year_reports.keys()):
+            species_data = year_reports[year].get(item["species_code"], {})
+            monthly_vals = species_data.get("monthly", {})
+            for month in sorted(monthly_vals.keys()):
+                month_date = f"{year}-{month:02d}-01"
+                if latest_monthly and month_date <= latest_monthly:
+                    continue
+                monthly_rows.append({
+                    "id_site": item["id_site"], "pollutant": item["pollutant"],
+                    "value": round(monthly_vals[month], 2),
+                    "year": year, "month": month,
+                    "date": month_date, "averaging_period": "monthly",
+                })
+        counts["monthly"] = await sb_insert_rows(session, db_sem, "monthly_averages", monthly_rows, tag)
+    else:
+        # Fallback: compute from hourly data (e.g. O3 has no Mean in MonitoringReport)
+        monthly_rows = []
+        for month_key, vals in sorted(monthly_bucket.items()):
+            month_date = f"{month_key}-01"
+            if latest_monthly and month_date <= latest_monthly:
+                continue
+            y, mo = month_key.split("-")
+            monthly_rows.append({
                 "id_site": item["id_site"], "pollutant": item["pollutant"],
                 "value": round(sum(vals) / len(vals), 2),
-                "year": year, "date": f"{year}-01-01", "averaging_period": "annual",
+                "year": int(y), "month": int(mo),
+                "date": month_date, "averaging_period": "monthly",
             })
-    counts["annual"] = await sb_insert_rows(session, db_sem, "annual_averages", annual_rows, tag)
+        counts["monthly"] = await sb_insert_rows(session, db_sem, "monthly_averages", monthly_rows, tag)
+
+        annual_rows = []
+        for year, vals in sorted(annual_bucket.items()):
+            if latest_annual and year <= int(latest_annual):
+                continue
+            is_leap = (year % 4 == 0 and (year % 100 != 0 or year % 400 == 0))
+            expected = 8784 if is_leap else 8760
+            if len(vals) >= math.floor(expected * 0.75):
+                annual_rows.append({
+                    "id_site": item["id_site"], "pollutant": item["pollutant"],
+                    "value": round(sum(vals) / len(vals), 2),
+                    "year": year, "date": f"{year}-01-01", "averaging_period": "annual",
+                })
+        counts["annual"] = await sb_insert_rows(session, db_sem, "annual_averages", annual_rows, tag)
 
     logger.info(f"{tag}: inserted h={counts['hourly']} d={counts['daily']} m={counts['monthly']} a={counts['annual']}")
     return counts
@@ -659,6 +821,7 @@ async def run_async_pipeline(items: list[dict]):
     db_sem = asyncio.Semaphore(DB_CONCURRENCY)
     task_sem = asyncio.Semaphore(TASK_CONCURRENCY)
     dead_letter: list[dict] = []
+    report_cache: dict[tuple[str, int], dict] = {}
     totals = {"hourly": 0, "daily": 0, "monthly": 0, "annual": 0, "errors": 0}
 
     connector = aiohttp.TCPConnector(limit=API_CONCURRENCY + DB_CONCURRENCY + 10, ttl_dns_cache=300)
@@ -668,7 +831,7 @@ async def run_async_pipeline(items: list[dict]):
         async def bounded_task(idx: int, item: dict):
             async with task_sem:
                 try:
-                    return await process_item_async(session, api_sem, db_sem, item, idx, len(items), dead_letter)
+                    return await process_item_async(session, api_sem, db_sem, item, idx, len(items), dead_letter, report_cache)
                 except Exception as e:
                     logger.error(f"Error [{idx + 1}/{len(items)}] {item['site_code']}/{item['pollutant']}: {e}")
                     dead_letter.append({"item": f"{item['site_code']}/{item['pollutant']}", "error": str(e)})
