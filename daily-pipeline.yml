@@ -32,10 +32,9 @@ jobs:
       env:
         SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
         SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-        API_CONCURRENCY: "20"
-        DB_CONCURRENCY: "5"
-        TASK_CONCURRENCY: "30"
-        INSERT_BATCH_SIZE: "200"
+        MAX_CONCURRENT_REQUESTS: '20'
+        API_CALL_DELAY: '0.2'
+        HTTP_MAX_RETRIES: '3'
       run: python pipeline.py
 
     - name: Upload logs (if any)
