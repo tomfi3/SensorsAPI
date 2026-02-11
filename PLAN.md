@@ -32,6 +32,37 @@ record building) intact.
 
 No new files created. No schema changes.
 
+### 1.4 Key Requirements
+
+These are the three driving goals behind the rewrite — not just speed.
+
+**R1: All London sensors, including those not yet in Supabase**
+The current pipeline only processes sensors that already exist in the `sensors` table,
+filtered to 3 boroughs. Many London sensors have never been added to Supabase. The new
+pipeline must **auto-discover all automatic monitoring stations** across every London
+borough from the London Air API (`MonitoringSiteSpecies` endpoint) and create them in
+Supabase before fetching data. This means the pipeline is self-bootstrapping — it does
+not depend on sensors being manually pre-populated.
+
+**R2: Include inactive/decommissioned sensors**
+The current pipeline filters to `end_date IS NULL` (active sensors only). Historical
+sensors that have been decommissioned still have years of valuable data. The new pipeline
+must **remove the active-only filter** and backfill data for all sensors regardless of
+their operational status.
+
+**R3: All pollutants including Ozone (O3)**
+The current pipeline only processes pollutants already listed in each sensor's
+`pollutants_measured` array. O3 was not previously included for some sensors. The new
+`discover_and_sync_sensors()` function pulls the **complete species list** from the
+London Air API for every sensor — including O3, NO2, PM10, PM2.5, SO2, and any others
+the API reports. If a sensor's `pollutants_measured` array in Supabase is missing species
+that the API reports, it gets updated. The pipeline then processes **every pollutant** in
+the array — no species whitelist or blacklist.
+
+**R4: Concurrent fetching for speed**
+Wrap all API calls in `asyncio` + `aiohttp` with a semaphore-based rate limiter.
+Target: first full backfill in ~25-30 minutes instead of ~8-9 hours.
+
 ---
 
 ## 2. Current System Analysis
