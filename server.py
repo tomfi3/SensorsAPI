@@ -22,7 +22,7 @@ def run_pipeline():
             ['python', 'pipeline.py'],
             capture_output=True,
             text=True,
-            timeout=600
+            timeout=3600
         )
         
         end_time = datetime.now()
@@ -40,7 +40,7 @@ def run_pipeline():
     except subprocess.TimeoutExpired:
         return jsonify({
             "status": "timeout",
-            "message": "Pipeline execution exceeded 10 minute timeout"
+            "message": "Pipeline execution exceeded 60 minute timeout"
         }), 500
     
     except Exception as e:

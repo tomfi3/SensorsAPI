@@ -11,7 +11,8 @@ on:
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
-    
+    timeout-minutes: 60
+
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
@@ -30,6 +31,9 @@ jobs:
       env:
         SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
         SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        MAX_CONCURRENT_REQUESTS: '20'
+        API_CALL_DELAY: '0.2'
+        HTTP_MAX_RETRIES: '3'
       run: python pipeline.py
     
     - name: Upload logs (if any)
