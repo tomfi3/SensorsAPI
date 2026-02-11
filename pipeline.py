@@ -249,10 +249,10 @@ def sync_sensors(supabase: Client, api_sites: list[dict], dry_run: bool) -> dict
     if skipped:
         logger.info(f"Skipped {len(skipped)} sites (missing coords): {', '.join(skipped[:20])}")
 
-    logger.info("Fetching existing sensors from database...")
+    logger.info("Fetching existing Automatic sensors from database...")
     result = supabase.table("sensors").select(
         "id_installation, id_site, site_code, pollutants_measured, end_date, start_date"
-    ).execute()
+    ).eq("sensor_type", "Automatic").execute()
 
     existing = {r["site_code"]: r for r in (result.data or [])}
     logger.info(f"Existing: {len(existing)} sensors in DB | API: {len(api_rows)} sites")
