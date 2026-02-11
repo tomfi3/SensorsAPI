@@ -15,6 +15,7 @@ Usage:
     python pipeline.py                          # Full pipeline
     python pipeline.py --sensors-only           # Phase 1 only
     python pipeline.py --data-only              # Phase 2 only
+    python pipeline.py --backfill               # Fast bulk load via direct Postgres
     python pipeline.py --dry-run                # Preview without writing
     python pipeline.py --sites RI1,WA7          # Filter to specific sites
     python pipeline.py --start-date 2021-01-01  # Override start date
@@ -64,6 +65,11 @@ TASK_CONCURRENCY = int(os.environ.get("TASK_CONCURRENCY", "30"))
 INSERT_BATCH_SIZE = int(os.environ.get("INSERT_BATCH_SIZE", "200"))
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "4"))
 MAX_DAYS_PER_CHUNK = 365
+
+# Backfill mode: direct Postgres (bypasses Supabase REST / Cloudflare)
+PG_CONCURRENCY = int(os.environ.get("PG_CONCURRENCY", "20"))
+PG_BATCH_SIZE = int(os.environ.get("PG_BATCH_SIZE", "1000"))
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 # Species we track (API code -> DB pollutant name)
 SPECIES_MAP = {
@@ -861,23 +867,342 @@ async def run_async_pipeline(items: list[dict]):
     logger.info("=" * 50)
 
 
+# ── Backfill Mode: Direct Postgres Engine ────────────────────────────────────
+
+# Column lists for COPY (exclude auto-increment id)
+PG_COLS = {
+    "hourly_averages": ("id_site", "pollutant", "year", "month", "day", "hour", "value", "datetime_start", "datetime_end"),
+    "daily_averages": ("id_site", "pollutant", "value", "year", "month", "day", "date", "averaging_period"),
+    "monthly_averages": ("id_site", "pollutant", "value", "year", "month", "date", "averaging_period"),
+    "annual_averages": ("id_site", "pollutant", "value", "year", "date", "averaging_period"),
+}
+
+
+def pg_get_latest_hourly(conn, id_site: str, pollutant: str) -> Optional[str]:
+    """Find latest hourly record via direct Postgres (year-by-year scan)."""
+    current_year = datetime.now().year
+    for year in range(current_year, current_year - 30, -1):
+        row = conn.execute(
+            "SELECT year, month, day, hour FROM hourly_averages "
+            "WHERE id_site = %s AND pollutant = %s AND year = %s "
+            "ORDER BY month DESC, day DESC, hour DESC LIMIT 1",
+            (id_site, pollutant, year),
+        ).fetchone()
+        if row:
+            return f"{row[0]}-{row[1]:02d}-{row[2]:02d} {row[3]:02d}:00:00"
+    return None
+
+
+def pg_get_latest_agg(conn, table: str, id_site: str, pollutant: str) -> Optional[str]:
+    col = "date" if table != "annual_averages" else "year"
+    row = conn.execute(
+        f"SELECT {col} FROM {table} "
+        f"WHERE id_site = %s AND pollutant = %s "
+        f"ORDER BY {col} DESC LIMIT 1",
+        (id_site, pollutant),
+    ).fetchone()
+    if row:
+        return str(row[0])
+    return None
+
+
+def pg_insert_rows(conn, table: str, rows: list[dict], tag: str) -> int:
+    """Bulk insert using psycopg COPY protocol — fastest possible Postgres insert."""
+    if not rows:
+        return 0
+    cols = PG_COLS[table]
+    inserted = 0
+    for i in range(0, len(rows), PG_BATCH_SIZE):
+        batch = rows[i:i + PG_BATCH_SIZE]
+        with conn.cursor() as cur:
+            with cur.copy(f"COPY {table} ({', '.join(cols)}) FROM STDIN") as copy:
+                for row in batch:
+                    copy.write_row(tuple(row[c] for c in cols))
+        conn.commit()
+        inserted += len(batch)
+    return inserted
+
+
+async def process_item_backfill(
+    session: aiohttp.ClientSession,
+    api_sem: asyncio.Semaphore,
+    pg_conn,
+    item: dict, idx: int, total: int,
+    dead_letter: list,
+    report_cache: dict[tuple[str, int], dict],
+) -> dict:
+    """Like process_item_async but writes via direct Postgres instead of REST API."""
+    tag = f"[{idx + 1}/{total}] {item['site_code']}/{item['pollutant']}"
+    counts = {"hourly": 0, "daily": 0, "monthly": 0, "annual": 0}
+
+    # 1. Check latest existing hourly data (incremental)
+    latest_hourly = pg_get_latest_hourly(pg_conn, item["id_site"], item["pollutant"])
+
+    effective_start = item["start_date"]
+    if latest_hourly:
+        try:
+            latest_dt = datetime.strptime(latest_hourly, "%Y-%m-%d %H:%M:%S")
+            incremental_start = (latest_dt + timedelta(hours=1)).strftime("%Y-%m-%d")
+            if incremental_start > item["end_date"]:
+                logger.info(f"{tag}: up to date (latest: {latest_hourly})")
+                return counts
+            effective_start = incremental_start
+            logger.info(f"{tag}: incremental from {effective_start}")
+        except ValueError:
+            pass
+
+    # 2. Fetch all yearly chunks concurrently
+    chunks = generate_yearly_chunks(effective_start, item["end_date"])
+    fetch_tasks = [
+        fetch_chunk_async(session, api_sem, item["site_code"], item["species_code"], cs, ce)
+        for cs, ce in chunks
+    ]
+    chunk_results = await asyncio.gather(*fetch_tasks)
+
+    all_measurements = []
+    for result in chunk_results:
+        all_measurements.extend(result)
+
+    if not all_measurements:
+        return counts
+
+    logger.info(f"{tag}: fetched {len(all_measurements)} hourly records ({len(chunks)} chunks)")
+
+    # 3. Parse, deduplicate, build rows + aggregation buckets
+    cutoff = datetime.strptime(latest_hourly, "%Y-%m-%d %H:%M:%S") if latest_hourly else None
+
+    hourly_rows = []
+    daily_bucket: dict[str, list[float]] = defaultdict(list)
+    monthly_bucket: dict[str, list[float]] = defaultdict(list)
+    annual_bucket: dict[int, list[float]] = defaultdict(list)
+
+    for m in all_measurements:
+        try:
+            dt = datetime.strptime(m["date"], "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            try:
+                dt = datetime.fromisoformat(m["date"].replace("Z", "+00:00"))
+                dt = dt.replace(tzinfo=None)
+            except (ValueError, TypeError):
+                continue
+
+        if cutoff and dt <= cutoff:
+            continue
+
+        year, month, day, hour = dt.year, dt.month, dt.day, dt.hour
+        val = m["value"]
+
+        dt_start = dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        dt_end = (dt + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+
+        hourly_rows.append({
+            "id_site": item["id_site"],
+            "pollutant": item["pollutant"],
+            "year": year, "month": month, "day": day, "hour": hour,
+            "value": val,
+            "datetime_start": dt_start,
+            "datetime_end": dt_end,
+        })
+
+        day_key = f"{year}-{month:02d}-{day:02d}"
+        month_key = f"{year}-{month:02d}"
+        daily_bucket[day_key].append(val)
+        monthly_bucket[month_key].append(val)
+        annual_bucket[year].append(val)
+
+    if not hourly_rows:
+        logger.info(f"{tag}: no new records after filtering")
+        return counts
+
+    # 4. Insert hourly data via COPY
+    counts["hourly"] = pg_insert_rows(pg_conn, "hourly_averages", hourly_rows, tag)
+
+    # 5. Daily averages (>= 18 hourly readings)
+    latest_daily = pg_get_latest_agg(pg_conn, "daily_averages", item["id_site"], item["pollutant"])
+    daily_rows = []
+    for day_key, vals in sorted(daily_bucket.items()):
+        if latest_daily and day_key <= latest_daily:
+            continue
+        if len(vals) >= 18:
+            y, mo, d = day_key.split("-")
+            daily_rows.append({
+                "id_site": item["id_site"], "pollutant": item["pollutant"],
+                "value": round(sum(vals) / len(vals), 2),
+                "year": int(y), "month": int(mo), "day": int(d),
+                "date": day_key, "averaging_period": "daily",
+            })
+    counts["daily"] = pg_insert_rows(pg_conn, "daily_averages", daily_rows, tag)
+
+    # 6. Monthly & Annual averages (MonitoringReport for NO2/PM/PM25, hourly fallback for O3)
+    latest_monthly = pg_get_latest_agg(pg_conn, "monthly_averages", item["id_site"], item["pollutant"])
+    latest_annual = pg_get_latest_agg(pg_conn, "annual_averages", item["id_site"], item["pollutant"])
+
+    current_year = datetime.now().year
+    start_year = item.get("start_year", current_year)
+
+    annual_from = int(latest_annual) + 1 if latest_annual else start_year
+    if latest_monthly:
+        monthly_from_year = int(latest_monthly[:4])
+    else:
+        monthly_from_year = start_year
+    fetch_from = min(annual_from, monthly_from_year)
+
+    report_tasks = [
+        fetch_monitoring_report_async(session, api_sem, item["site_code"], y, report_cache)
+        for y in range(fetch_from, current_year + 1)
+    ]
+    report_results = await asyncio.gather(*report_tasks)
+    year_reports = {y: r for y, r in zip(range(fetch_from, current_year + 1), report_results)}
+
+    has_official_mean = any(
+        item["species_code"] in yr_data for yr_data in year_reports.values()
+    )
+
+    if has_official_mean:
+        annual_rows = []
+        for year in sorted(year_reports.keys()):
+            if latest_annual and year <= int(latest_annual):
+                continue
+            species_data = year_reports[year].get(item["species_code"], {})
+            annual_val = species_data.get("annual")
+            if annual_val is not None:
+                annual_rows.append({
+                    "id_site": item["id_site"], "pollutant": item["pollutant"],
+                    "value": round(annual_val, 2),
+                    "year": year, "date": f"{year}-01-01", "averaging_period": "annual",
+                })
+        counts["annual"] = pg_insert_rows(pg_conn, "annual_averages", annual_rows, tag)
+
+        monthly_rows = []
+        for year in sorted(year_reports.keys()):
+            species_data = year_reports[year].get(item["species_code"], {})
+            monthly_vals = species_data.get("monthly", {})
+            for mo in sorted(monthly_vals.keys()):
+                month_date = f"{year}-{mo:02d}-01"
+                if latest_monthly and month_date <= latest_monthly:
+                    continue
+                monthly_rows.append({
+                    "id_site": item["id_site"], "pollutant": item["pollutant"],
+                    "value": round(monthly_vals[mo], 2),
+                    "year": year, "month": mo,
+                    "date": month_date, "averaging_period": "monthly",
+                })
+        counts["monthly"] = pg_insert_rows(pg_conn, "monthly_averages", monthly_rows, tag)
+    else:
+        monthly_rows = []
+        for month_key, vals in sorted(monthly_bucket.items()):
+            month_date = f"{month_key}-01"
+            if latest_monthly and month_date <= latest_monthly:
+                continue
+            y, mo = month_key.split("-")
+            monthly_rows.append({
+                "id_site": item["id_site"], "pollutant": item["pollutant"],
+                "value": round(sum(vals) / len(vals), 2),
+                "year": int(y), "month": int(mo),
+                "date": month_date, "averaging_period": "monthly",
+            })
+        counts["monthly"] = pg_insert_rows(pg_conn, "monthly_averages", monthly_rows, tag)
+
+        annual_rows = []
+        for year, vals in sorted(annual_bucket.items()):
+            if latest_annual and year <= int(latest_annual):
+                continue
+            is_leap = (year % 4 == 0 and (year % 100 != 0 or year % 400 == 0))
+            expected = 8784 if is_leap else 8760
+            if len(vals) >= math.floor(expected * 0.75):
+                annual_rows.append({
+                    "id_site": item["id_site"], "pollutant": item["pollutant"],
+                    "value": round(sum(vals) / len(vals), 2),
+                    "year": year, "date": f"{year}-01-01", "averaging_period": "annual",
+                })
+        counts["annual"] = pg_insert_rows(pg_conn, "annual_averages", annual_rows, tag)
+
+    logger.info(f"{tag}: inserted h={counts['hourly']} d={counts['daily']} m={counts['monthly']} a={counts['annual']}")
+    return counts
+
+
+async def run_backfill_pipeline(items: list[dict]):
+    """Fast backfill using direct Postgres COPY + async API fetches."""
+    import psycopg
+
+    logger.info(f"Backfill mode: Direct Postgres | API={API_CONCURRENCY} PG={PG_CONCURRENCY} tasks={len(items)}")
+
+    api_sem = asyncio.Semaphore(API_CONCURRENCY)
+    task_sem = asyncio.Semaphore(PG_CONCURRENCY)
+    dead_letter: list[dict] = []
+    report_cache: dict[tuple[str, int], dict] = {}
+    totals = {"hourly": 0, "daily": 0, "monthly": 0, "annual": 0, "errors": 0}
+
+    connector = aiohttp.TCPConnector(limit=API_CONCURRENCY + 10, ttl_dns_cache=300)
+    timeout = aiohttp.ClientTimeout(total=120, connect=30)
+
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        async def bounded_task(idx: int, item: dict):
+            async with task_sem:
+                # Each task gets its own Postgres connection (thread-safe COPY)
+                pg_conn = psycopg.connect(DATABASE_URL, autocommit=False)
+                try:
+                    result = await process_item_backfill(
+                        session, api_sem, pg_conn, item, idx, len(items), dead_letter, report_cache,
+                    )
+                    return result
+                except Exception as e:
+                    logger.error(f"Error [{idx + 1}/{len(items)}] {item['site_code']}/{item['pollutant']}: {e}")
+                    dead_letter.append({"item": f"{item['site_code']}/{item['pollutant']}", "error": str(e)})
+                    return None
+                finally:
+                    pg_conn.close()
+
+        tasks = [bounded_task(i, item) for i, item in enumerate(items)]
+        results = await asyncio.gather(*tasks)
+
+    for result in results:
+        if result:
+            for key in ("hourly", "daily", "monthly", "annual"):
+                totals[key] += result[key]
+        else:
+            totals["errors"] += 1
+
+    logger.info("=" * 50)
+    logger.info("Backfill Summary (Direct Postgres)")
+    logger.info(f"  Hourly records:   {totals['hourly']:,}")
+    logger.info(f"  Daily averages:   {totals['daily']:,}")
+    logger.info(f"  Monthly averages: {totals['monthly']:,}")
+    logger.info(f"  Annual averages:  {totals['annual']:,}")
+    logger.info(f"  Task errors:      {totals['errors']}")
+    if dead_letter:
+        logger.warning(f"  Dead letter queue: {len(dead_letter)} entries")
+        for dl in dead_letter[:20]:
+            logger.warning(f"    - {dl}")
+    logger.info("=" * 50)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="London Air Data Pipeline")
     parser.add_argument("--sensors-only", action="store_true", help="Phase 1 only")
     parser.add_argument("--data-only", action="store_true", help="Phase 2 only")
+    parser.add_argument("--backfill", action="store_true", help="Fast backfill via direct Postgres (requires DATABASE_URL)")
     parser.add_argument("--dry-run", action="store_true", help="Preview without writing")
     parser.add_argument("--sites", type=str, help="Comma-separated site codes (e.g. RI1,WA7)")
     parser.add_argument("--start-date", type=str, help="Override start date (YYYY-MM-DD)")
     args = parser.parse_args()
 
+    mode = "DRY RUN" if args.dry_run else ("BACKFILL" if args.backfill else "LIVE")
     logger.info("=" * 60)
     logger.info("London Air Data Pipeline (async)")
-    logger.info(f"  Mode:        {'DRY RUN' if args.dry_run else 'LIVE'}")
+    logger.info(f"  Mode:        {mode}")
     logger.info(f"  Supabase:    {SUPABASE_URL}")
-    logger.info(f"  Concurrency: API={API_CONCURRENCY} DB={DB_CONCURRENCY}")
+    if args.backfill:
+        logger.info(f"  Concurrency: API={API_CONCURRENCY} PG={PG_CONCURRENCY} (direct Postgres)")
+    else:
+        logger.info(f"  Concurrency: API={API_CONCURRENCY} DB={DB_CONCURRENCY}")
     logger.info("=" * 60)
+
+    if args.backfill and not DATABASE_URL:
+        logger.error("DATABASE_URL environment variable is required for --backfill mode")
+        sys.exit(1)
 
     if not SUPABASE_URL or not SUPABASE_KEY:
         logger.error("SUPABASE_URL and SUPABASE_KEY environment variables are required")
@@ -912,6 +1237,8 @@ def main():
             for item in items[:20]:
                 c = len(generate_yearly_chunks(item["start_date"], item["end_date"]))
                 logger.info(f"  {item['site_code']}/{item['pollutant']}: {item['start_date']} -> {item['end_date']} ({c} chunks)")
+        elif args.backfill:
+            asyncio.run(run_backfill_pipeline(items))
         else:
             asyncio.run(run_async_pipeline(items))
 
