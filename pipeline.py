@@ -1,21 +1,49 @@
+"""
+London Air Data Pipeline (async)
+
+Phase 1: Sync sensors from MonitoringSiteSpecies API -> Supabase sensors table
+Phase 2: Fetch monitoring data with async I/O engine (aiohttp + semaphores)
+
+Architecture:
+    - Single aiohttp.ClientSession with TCP connection pooling
+    - API Semaphore (20): bounds concurrent ERG API requests
+    - DB Semaphore (5): bounds concurrent Supabase writes (Cloudflare limit)
+    - Pre-computed task list: all sensor x pollutant x yearly chunks
+    - Exponential backoff + dead letter queue for resilience
+
+Usage:
+    python pipeline.py                          # Full pipeline
+    python pipeline.py --sensors-only           # Phase 1 only
+    python pipeline.py --data-only              # Phase 2 only
+    python pipeline.py --dry-run                # Preview without writing
+    python pipeline.py --sites RI1,WA7          # Filter to specific sites
+    python pipeline.py --start-date 2021-01-01  # Override start date
+"""
+
 import os
 import asyncio
 import aiohttp
 import pandas as pd
 import requests
 from datetime import datetime, timedelta
-from supabase import create_client, Client
-from dotenv import load_dotenv
 from typing import Optional
+from collections import defaultdict
 import logging
 import re
 
+import aiohttp
+import requests
+from dotenv import load_dotenv
+from supabase import create_client, Client
+
 load_dotenv()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+# Fix Windows console encoding
+if sys.platform == "win32":
+    sys.stdout = codecs.getwriter("utf-8")(sys.stdout.buffer, "strict")
+    sys.stderr = codecs.getwriter("utf-8")(sys.stderr.buffer, "strict")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 # API endpoints
@@ -245,27 +273,11 @@ def load_sensors(supabase: Client) -> pd.DataFrame:
 
 def get_latest_period(supabase: Client, id_site: str, pollutant: str, table: str) -> Optional[dict]:
     try:
-        if table == 'annual_averages':
-            result = supabase.table(table).select('year')\
-                .eq('id_site', id_site).eq('pollutant', pollutant)\
-                .order('year', desc=True).limit(1).execute()
-            if result.data:
-                return {'year': result.data[0]['year']}
-        elif table == 'monthly_averages':
-            result = supabase.table(table).select('year, month')\
-                .eq('id_site', id_site).eq('pollutant', pollutant)\
-                .order('year', desc=True).order('month', desc=True).limit(1).execute()
-            if result.data:
-                return {'year': result.data[0]['year'], 'month': result.data[0]['month']}
-        elif table == 'daily_averages':
-            result = supabase.table(table).select('date')\
-                .eq('id_site', id_site).eq('pollutant', pollutant)\
-                .order('date', desc=True).limit(1).execute()
-            if result.data:
-                return {'date': result.data[0]['date']}
+        lat = float(lat_str)
+        lon = float(lon_str)
+    except (ValueError, TypeError):
         return None
-    except Exception as e:
-        logger.error(f"Error querying {table} for {id_site}/{pollutant}: {e}")
+    if lat == 0 or lon == 0:
         return None
 
 

@@ -24,10 +24,10 @@ def run_pipeline():
             text=True,
             timeout=3600
         )
-        
+
         end_time = datetime.now()
         duration = (end_time - start_time).total_seconds()
-        
+
         return jsonify({
             "status": "success" if result.returncode == 0 else "error",
             "timestamp": start_time.isoformat(),
@@ -36,7 +36,7 @@ def run_pipeline():
             "output": result.stdout[-500:] if result.stdout else "",
             "error": result.stderr[-500:] if result.stderr else ""
         })
-    
+
     except subprocess.TimeoutExpired:
         return jsonify({
             "status": "timeout",
