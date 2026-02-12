@@ -27,7 +27,10 @@ import codecs
 import argparse
 import asyncio
 import math
+import time
 from datetime import datetime, timedelta
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from typing import Optional
 from collections import defaultdict
 import logging
@@ -44,8 +47,45 @@ if sys.platform == "win32":
     sys.stdout = codecs.getwriter("utf-8")(sys.stdout.buffer, "strict")
     sys.stderr = codecs.getwriter("utf-8")(sys.stderr.buffer, "strict")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+
+class FlushHandler(logging.StreamHandler):
+    """StreamHandler that flushes after every emit (no buffering delay)."""
+    def emit(self, record):
+        super().emit(record)
+        self.flush()
+
+
+def setup_logging() -> logging.Logger:
+    """Configure dual logging: console (INFO) + rotating file (DEBUG)."""
+    log_dir = Path(__file__).parent / "logs"
+    log_dir.mkdir(exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = log_dir / f"pipeline_{timestamp}.log"
+
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+
+    # Console: INFO, concise format, flush-friendly
+    console = FlushHandler(sys.stderr)
+    console.setLevel(logging.INFO)
+    console.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    root.addHandler(console)
+
+    # File: DEBUG, rich format, rotating 50 MB x 5
+    file_handler = RotatingFileHandler(
+        log_file, maxBytes=50 * 1024 * 1024, backupCount=5, encoding="utf-8",
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(funcName)s:%(lineno)d — %(message)s"
+    ))
+    root.addHandler(file_handler)
+
+    return logging.getLogger(__name__)
+
+
+logger = setup_logging()
 
 # ── Environment ───────────────────────────────────────────────────────────────
 
@@ -155,11 +195,12 @@ def parse_api_date(raw: Optional[str]) -> Optional[str]:
         dt = datetime.strptime(raw.strip(), "%Y-%m-%d %H:%M:%S")
         return dt.strftime("%Y-%m-%d")
     except ValueError:
-        pass
+        logger.debug("parse_api_date: strptime failed for %r, trying fromisoformat", raw)
     try:
         dt = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
         return dt.strftime("%Y-%m-%d")
     except (ValueError, TypeError):
+        logger.debug("parse_api_date: could not parse %r", raw)
         return None
 
 
@@ -208,6 +249,7 @@ def api_site_to_row(site: dict) -> Optional[dict]:
         lat = float(lat_str)
         lon = float(lon_str)
     except (ValueError, TypeError):
+        logger.warning("api_site_to_row: bad lat/lon for site %s: lat=%r lon=%r", site_code, lat_str, lon_str)
         return None
     if lat == 0 or lon == 0:
         return None
@@ -341,8 +383,8 @@ async def sb_get_latest_hourly(
                         if data:
                             r = data[0]
                             return f"{r['year']}-{r['month']:02d}-{r['day']:02d} {r['hour']:02d}:00:00"
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("sb_get_latest_hourly: %s/%s year=%d — %s", id_site, pollutant, year, e)
     return None
 
 
@@ -350,22 +392,34 @@ async def sb_get_latest_agg(
     session: aiohttp.ClientSession, db_sem: asyncio.Semaphore,
     table: str, id_site: str, pollutant: str,
 ) -> Optional[str]:
-    col = "date" if table != "annual_averages" else "year"
-    url = (
-        f"{_sb_rest_url(table)}"
-        f"?select={col}"
-        f"&id_site=eq.{id_site}&pollutant=eq.{pollutant}"
-        f"&order={col}.desc&limit=1"
-    )
-    async with db_sem:
-        try:
-            async with session.get(url, headers=_sb_headers()) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if data:
-                        return str(data[0][col])
-        except Exception:
-            pass
+    """Find latest aggregate record via year-by-year scan (avoids timeout on large tables)."""
+    current_year = datetime.now().year
+    for year in range(current_year, current_year - 30, -1):
+        if table == "annual_averages":
+            url = (
+                f"{_sb_rest_url(table)}"
+                f"?select=year"
+                f"&id_site=eq.{id_site}&pollutant=eq.{pollutant}"
+                f"&year=eq.{year}&limit=1"
+            )
+        else:
+            url = (
+                f"{_sb_rest_url(table)}"
+                f"?select=date"
+                f"&id_site=eq.{id_site}&pollutant=eq.{pollutant}"
+                f"&date=gte.{year}-01-01&date=lt.{year + 1}-01-01"
+                f"&order=date.desc&limit=1"
+            )
+        async with db_sem:
+            try:
+                async with session.get(url, headers=_sb_headers()) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data:
+                            col = "year" if table == "annual_averages" else "date"
+                            return str(data[0][col])
+            except Exception as e:
+                logger.debug("sb_get_latest_agg: %s %s/%s year=%d — %s", table, id_site, pollutant, year, e)
     return None
 
 
@@ -435,10 +489,12 @@ async def fetch_chunk_async(
                     if resp.status != 200:
                         return []
                     data = await resp.json(content_type=None)
-            except Exception:
+            except Exception as e:
                 if attempt < MAX_RETRIES - 1:
+                    logger.warning("fetch_chunk_async: %s/%s retry %d — %s", site_code, species_code, attempt + 1, e)
                     await asyncio.sleep(2 ** attempt)
                     continue
+                logger.warning("fetch_chunk_async: %s/%s failed after %d retries — %s", site_code, species_code, MAX_RETRIES, e)
                 return []
 
         records = (data.get("RawAQData") or data.get("AirQualityData") or {}).get("Data", [])
@@ -454,6 +510,7 @@ async def fetch_chunk_async(
             try:
                 results.append({"date": date_str, "value": float(val_str)})
             except (ValueError, TypeError):
+                logger.debug("fetch_chunk_async: bad value %r for date %s in %s/%s", val_str, date_str, site_code, species_code)
                 continue
         return results
     return []
@@ -503,10 +560,12 @@ async def fetch_monitoring_report_async(
                             report_cache[cache_key] = result
                             return result
                         data = await resp.json(content_type=None)
-                except Exception:
+                except Exception as e:
                     if attempt < MAX_RETRIES - 1:
+                        logger.warning("fetch_monitoring_report: %s/%d retry %d — %s", site_code, year, attempt + 1, e)
                         await asyncio.sleep(2 ** attempt)
                         continue
+                    logger.warning("fetch_monitoring_report: %s/%d failed after %d retries — %s", site_code, year, MAX_RETRIES, e)
                     report_cache[cache_key] = result
                     return result
 
@@ -538,7 +597,7 @@ async def fetch_monitoring_report_async(
                     try:
                         annual = float(annual_val)
                     except (ValueError, TypeError):
-                        pass
+                        logger.debug("fetch_monitoring_report: bad annual value %r for %s/%d/%s", annual_val, site_code, year, species_code)
 
                 # Extract monthly values (@Month1 through @Month12)
                 monthly: dict[int, float] = {}
@@ -548,7 +607,7 @@ async def fetch_monitoring_report_async(
                         try:
                             monthly[m] = float(mv)
                         except (ValueError, TypeError):
-                            pass
+                            logger.debug("fetch_monitoring_report: bad monthly value %r for %s/%d/%s month %d", mv, site_code, year, species_code, m)
 
                 result[species_code] = {"annual": annual, "monthly": monthly}
 
@@ -820,6 +879,44 @@ async def process_item_async(
     return counts
 
 
+class ProgressTracker:
+    """Logs a periodic summary of task progress every `interval` seconds."""
+
+    def __init__(self, total: int, interval: float = 30):
+        self.total = total
+        self.interval = interval
+        self.completed = 0
+        self.active = 0
+        self.errors = 0
+        self._start = time.monotonic()
+        self._task: Optional[asyncio.Task] = None
+
+    def start(self):
+        self._task = asyncio.create_task(self._loop())
+
+    async def stop(self):
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+
+    async def _loop(self):
+        while True:
+            await asyncio.sleep(self.interval)
+            elapsed = time.monotonic() - self._start
+            mins, secs = divmod(int(elapsed), 60)
+            logger.info(
+                "[PROGRESS] %d/%d done | %d active | %d errors | elapsed %dm%02ds",
+                self.completed, self.total, self.active, self.errors, mins, secs,
+            )
+
+    @property
+    def elapsed(self) -> float:
+        return time.monotonic() - self._start
+
+
 async def run_async_pipeline(items: list[dict]):
     logger.info(f"Phase 2: Async engine | API={API_CONCURRENCY} DB={DB_CONCURRENCY} tasks={len(items)}")
 
@@ -829,6 +926,7 @@ async def run_async_pipeline(items: list[dict]):
     dead_letter: list[dict] = []
     report_cache: dict[tuple[str, int], dict] = {}
     totals = {"hourly": 0, "daily": 0, "monthly": 0, "annual": 0, "errors": 0}
+    progress = ProgressTracker(total=len(items))
 
     connector = aiohttp.TCPConnector(limit=API_CONCURRENCY + DB_CONCURRENCY + 10, ttl_dns_cache=300)
     timeout = aiohttp.ClientTimeout(total=120, connect=30)
@@ -836,15 +934,27 @@ async def run_async_pipeline(items: list[dict]):
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         async def bounded_task(idx: int, item: dict):
             async with task_sem:
+                progress.active += 1
                 try:
-                    return await process_item_async(session, api_sem, db_sem, item, idx, len(items), dead_letter, report_cache)
+                    result = await process_item_async(session, api_sem, db_sem, item, idx, len(items), dead_letter, report_cache)
+                    progress.completed += 1
+                    return result
                 except Exception as e:
-                    logger.error(f"Error [{idx + 1}/{len(items)}] {item['site_code']}/{item['pollutant']}: {e}")
+                    logger.exception("Error [{idx}/{total}] {site}/{poll}".format(
+                        idx=idx + 1, total=len(items),
+                        site=item['site_code'], poll=item['pollutant'],
+                    ))
                     dead_letter.append({"item": f"{item['site_code']}/{item['pollutant']}", "error": str(e)})
+                    progress.errors += 1
+                    progress.completed += 1
                     return None
+                finally:
+                    progress.active -= 1
 
+        progress.start()
         tasks = [bounded_task(i, item) for i, item in enumerate(items)]
         results = await asyncio.gather(*tasks)
+        await progress.stop()
 
     for result in results:
         if result:
@@ -853,9 +963,14 @@ async def run_async_pipeline(items: list[dict]):
         else:
             totals["errors"] += 1
 
+    elapsed = progress.elapsed
+    mins, secs = divmod(int(elapsed), 60)
+    hourly_per_sec = totals["hourly"] / elapsed if elapsed > 0 else 0
+
     logger.info("=" * 50)
     logger.info("Phase 2 Summary")
-    logger.info(f"  Hourly records:   {totals['hourly']:,}")
+    logger.info(f"  Elapsed:          {mins}m{secs:02d}s")
+    logger.info(f"  Hourly records:   {totals['hourly']:,} ({hourly_per_sec:,.0f} rec/s)")
     logger.info(f"  Daily averages:   {totals['daily']:,}")
     logger.info(f"  Monthly averages: {totals['monthly']:,}")
     logger.info(f"  Annual averages:  {totals['annual']:,}")
@@ -894,15 +1009,29 @@ def pg_get_latest_hourly(conn, id_site: str, pollutant: str) -> Optional[str]:
 
 
 def pg_get_latest_agg(conn, table: str, id_site: str, pollutant: str) -> Optional[str]:
-    col = "date" if table != "annual_averages" else "year"
-    row = conn.execute(
-        f"SELECT {col} FROM {table} "
-        f"WHERE id_site = %s AND pollutant = %s "
-        f"ORDER BY {col} DESC LIMIT 1",
-        (id_site, pollutant),
-    ).fetchone()
-    if row:
-        return str(row[0])
+    """Find latest aggregate record via year-by-year scan (avoids timeout on large tables)."""
+    current_year = datetime.now().year
+    if table == "annual_averages":
+        for year in range(current_year, current_year - 30, -1):
+            row = conn.execute(
+                "SELECT year FROM annual_averages "
+                "WHERE id_site = %s AND pollutant = %s AND year = %s "
+                "LIMIT 1",
+                (id_site, pollutant, year),
+            ).fetchone()
+            if row:
+                return str(row[0])
+    else:
+        for year in range(current_year, current_year - 30, -1):
+            row = conn.execute(
+                f"SELECT date FROM {table} "
+                f"WHERE id_site = %s AND pollutant = %s "
+                f"AND date >= %s AND date < %s "
+                f"ORDER BY date DESC LIMIT 1",
+                (id_site, pollutant, f"{year}-01-01", f"{year + 1}-01-01"),
+            ).fetchone()
+            if row:
+                return str(row[0])
     return None
 
 
@@ -1132,6 +1261,7 @@ async def run_backfill_pipeline(items: list[dict]):
     dead_letter: list[dict] = []
     report_cache: dict[tuple[str, int], dict] = {}
     totals = {"hourly": 0, "daily": 0, "monthly": 0, "annual": 0, "errors": 0}
+    progress = ProgressTracker(total=len(items))
 
     connector = aiohttp.TCPConnector(limit=API_CONCURRENCY + 10, ttl_dns_cache=300)
     timeout = aiohttp.ClientTimeout(total=120, connect=30)
@@ -1139,22 +1269,32 @@ async def run_backfill_pipeline(items: list[dict]):
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         async def bounded_task(idx: int, item: dict):
             async with task_sem:
+                progress.active += 1
                 # Each task gets its own Postgres connection (thread-safe COPY)
                 pg_conn = psycopg.connect(DATABASE_URL, autocommit=False)
                 try:
                     result = await process_item_backfill(
                         session, api_sem, pg_conn, item, idx, len(items), dead_letter, report_cache,
                     )
+                    progress.completed += 1
                     return result
                 except Exception as e:
-                    logger.error(f"Error [{idx + 1}/{len(items)}] {item['site_code']}/{item['pollutant']}: {e}")
+                    logger.exception("Error [{idx}/{total}] {site}/{poll}".format(
+                        idx=idx + 1, total=len(items),
+                        site=item['site_code'], poll=item['pollutant'],
+                    ))
                     dead_letter.append({"item": f"{item['site_code']}/{item['pollutant']}", "error": str(e)})
+                    progress.errors += 1
+                    progress.completed += 1
                     return None
                 finally:
                     pg_conn.close()
+                    progress.active -= 1
 
+        progress.start()
         tasks = [bounded_task(i, item) for i, item in enumerate(items)]
         results = await asyncio.gather(*tasks)
+        await progress.stop()
 
     for result in results:
         if result:
@@ -1163,9 +1303,14 @@ async def run_backfill_pipeline(items: list[dict]):
         else:
             totals["errors"] += 1
 
+    elapsed = progress.elapsed
+    mins, secs = divmod(int(elapsed), 60)
+    hourly_per_sec = totals["hourly"] / elapsed if elapsed > 0 else 0
+
     logger.info("=" * 50)
     logger.info("Backfill Summary (Direct Postgres)")
-    logger.info(f"  Hourly records:   {totals['hourly']:,}")
+    logger.info(f"  Elapsed:          {mins}m{secs:02d}s")
+    logger.info(f"  Hourly records:   {totals['hourly']:,} ({hourly_per_sec:,.0f} rec/s)")
     logger.info(f"  Daily averages:   {totals['daily']:,}")
     logger.info(f"  Monthly averages: {totals['monthly']:,}")
     logger.info(f"  Annual averages:  {totals['annual']:,}")
@@ -1208,13 +1353,18 @@ def main():
         logger.error("SUPABASE_URL and SUPABASE_KEY environment variables are required")
         sys.exit(1)
 
+    pipeline_start = time.monotonic()
+
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
     api_sites = fetch_site_species()
 
     # Phase 1
     if not args.data_only:
+        phase1_start = time.monotonic()
         sensors = sync_sensors(supabase, api_sites, args.dry_run)
+        phase1_elapsed = time.monotonic() - phase1_start
+        logger.info(f"Phase 1 completed in {phase1_elapsed:.1f}s")
     else:
         sensors = {}
         for site in api_sites:
@@ -1242,7 +1392,9 @@ def main():
         else:
             asyncio.run(run_async_pipeline(items))
 
-    logger.info(f"Pipeline completed at {datetime.now().isoformat()}")
+    total_elapsed = time.monotonic() - pipeline_start
+    mins, secs = divmod(int(total_elapsed), 60)
+    logger.info(f"Pipeline completed at {datetime.now().isoformat()} (total: {mins}m{secs:02d}s)")
 
 
 if __name__ == "__main__":
