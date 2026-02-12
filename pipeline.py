@@ -110,6 +110,7 @@ MAX_DAYS_PER_CHUNK = 365
 PG_CONCURRENCY = int(os.environ.get("PG_CONCURRENCY", "20"))
 PG_BATCH_SIZE = int(os.environ.get("PG_BATCH_SIZE", "1000"))
 DATABASE_URL = os.environ.get("DATABASE_URL")
+ITEM_TIMEOUT = int(os.environ.get("ITEM_TIMEOUT", "600"))  # per-item timeout in seconds
 
 # Species we track (API code -> DB pollutant name)
 SPECIES_MAP = {
@@ -362,39 +363,71 @@ def _sb_rest_url(table: str) -> str:
     return f"{SUPABASE_URL}/rest/v1/{table}"
 
 
+async def _sb_read_with_retry(
+    session: aiohttp.ClientSession, db_sem: asyncio.Semaphore,
+    url: str, tag: str, max_retries: int = 3,
+) -> Optional[list]:
+    """Supabase read with retry on transient errors (429, 500, 502, 503, timeout)."""
+    for attempt in range(max_retries):
+        wait = 0
+        async with db_sem:
+            try:
+                async with session.get(url, headers=_sb_headers()) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    if resp.status in (429, 500, 502, 503):
+                        wait = 2 ** attempt + 1
+                        logger.warning(f"{tag}: read retry {attempt+1} ({resp.status})")
+                    else:
+                        logger.warning(f"{tag}: read failed ({resp.status})")
+                        return None
+            except Exception as e:
+                wait = 2 ** attempt + 1
+                logger.warning(f"{tag}: read error attempt {attempt+1}: {e}")
+        if wait:
+            await asyncio.sleep(wait)
+    logger.warning(f"{tag}: read failed after {max_retries} retries")
+    return None
+
+
+EARLY_EXIT_MISSES = 3  # stop scanning after this many consecutive empty years
+
+
 async def sb_get_latest_hourly(
     session: aiohttp.ClientSession, db_sem: asyncio.Semaphore,
-    id_site: str, pollutant: str,
+    id_site: str, pollutant: str, earliest_year: int = 1996,
 ) -> Optional[str]:
-    """Scan year-by-year to find latest hourly record (avoids timeout on large table)."""
+    """Scan year-by-year to find latest hourly record. Stops after 3 consecutive empty years."""
     current_year = datetime.now().year
-    for year in range(current_year, current_year - 30, -1):
+    consecutive_misses = 0
+    tag = f"sb_read:{id_site}/{pollutant}"
+    for year in range(current_year, max(earliest_year - 1, current_year - 30), -1):
         url = (
             f"{_sb_rest_url('hourly_averages')}"
             f"?select=year,month,day,hour"
             f"&id_site=eq.{id_site}&pollutant=eq.{pollutant}&year=eq.{year}"
             f"&order=month.desc,day.desc,hour.desc&limit=1"
         )
-        async with db_sem:
-            try:
-                async with session.get(url, headers=_sb_headers()) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if data:
-                            r = data[0]
-                            return f"{r['year']}-{r['month']:02d}-{r['day']:02d} {r['hour']:02d}:00:00"
-            except Exception as e:
-                logger.debug("sb_get_latest_hourly: %s/%s year=%d — %s", id_site, pollutant, year, e)
+        data = await _sb_read_with_retry(session, db_sem, url, tag)
+        if data:
+            r = data[0]
+            return f"{r['year']}-{r['month']:02d}-{r['day']:02d} {r['hour']:02d}:00:00"
+        else:
+            consecutive_misses += 1
+            if consecutive_misses >= EARLY_EXIT_MISSES:
+                break
     return None
 
 
 async def sb_get_latest_agg(
     session: aiohttp.ClientSession, db_sem: asyncio.Semaphore,
-    table: str, id_site: str, pollutant: str,
+    table: str, id_site: str, pollutant: str, earliest_year: int = 1996,
 ) -> Optional[str]:
-    """Find latest aggregate record via year-by-year scan (avoids timeout on large tables)."""
+    """Find latest aggregate record via year-by-year scan. Stops after 3 consecutive empty years."""
     current_year = datetime.now().year
-    for year in range(current_year, current_year - 30, -1):
+    consecutive_misses = 0
+    tag = f"sb_read:{table}/{id_site}/{pollutant}"
+    for year in range(current_year, max(earliest_year - 1, current_year - 30), -1):
         if table == "annual_averages":
             url = (
                 f"{_sb_rest_url(table)}"
@@ -410,16 +443,14 @@ async def sb_get_latest_agg(
                 f"&date=gte.{year}-01-01&date=lt.{year + 1}-01-01"
                 f"&order=date.desc&limit=1"
             )
-        async with db_sem:
-            try:
-                async with session.get(url, headers=_sb_headers()) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if data:
-                            col = "year" if table == "annual_averages" else "date"
-                            return str(data[0][col])
-            except Exception as e:
-                logger.debug("sb_get_latest_agg: %s %s/%s year=%d — %s", table, id_site, pollutant, year, e)
+        data = await _sb_read_with_retry(session, db_sem, url, tag)
+        if data:
+            col = "year" if table == "annual_averages" else "date"
+            return str(data[0][col])
+        else:
+            consecutive_misses += 1
+            if consecutive_misses >= EARLY_EXIT_MISSES:
+                break
     return None
 
 
@@ -673,6 +704,170 @@ def build_work_items(
     return items
 
 
+async def _fill_aggregate_gaps_sb(
+    session: aiohttp.ClientSession, api_sem: asyncio.Semaphore,
+    db_sem: asyncio.Semaphore,
+    item: dict, tag: str, counts: dict,
+    report_cache: dict[tuple[str, int], dict],
+    latest_hourly: str,
+):
+    """Check and fill daily/monthly/annual gaps via Supabase REST when hourly is already up to date."""
+    earliest_year = item.get("start_year", 1996)
+    latest_daily = await sb_get_latest_agg(session, db_sem, "daily_averages", item["id_site"], item["pollutant"], earliest_year)
+    latest_monthly = await sb_get_latest_agg(session, db_sem, "monthly_averages", item["id_site"], item["pollutant"], earliest_year)
+    latest_annual = await sb_get_latest_agg(session, db_sem, "annual_averages", item["id_site"], item["pollutant"], earliest_year)
+
+    current_year = datetime.now().year
+    start_year = item.get("start_year", current_year)
+    latest_hourly_year = int(latest_hourly[:4])
+
+    # Check if daily is behind hourly — log warning (recomputing daily from REST is too expensive)
+    if latest_daily:
+        daily_year = int(latest_daily[:4])
+        if daily_year < latest_hourly_year:
+            logger.info(f"{tag}: daily gap detected (daily={latest_daily}, hourly={latest_hourly}) — skipping (requires data re-fetch)")
+    elif latest_hourly:
+        logger.info(f"{tag}: no daily data exists — skipping (requires data re-fetch)")
+
+    # Check monthly/annual via MonitoringReport
+    annual_from = int(latest_annual) + 1 if latest_annual else start_year
+    monthly_from_year = int(latest_monthly[:4]) if latest_monthly else start_year
+    fetch_from = min(annual_from, monthly_from_year)
+
+    if fetch_from > current_year:
+        return  # nothing to fill
+
+    report_tasks = [
+        fetch_monitoring_report_async(session, api_sem, item["site_code"], y, report_cache)
+        for y in range(fetch_from, current_year + 1)
+    ]
+    report_results = await asyncio.gather(*report_tasks)
+    year_reports = {y: r for y, r in zip(range(fetch_from, current_year + 1), report_results)}
+
+    has_official_mean = any(
+        item["species_code"] in yr_data for yr_data in year_reports.values()
+    )
+
+    if has_official_mean:
+        # Fill annual gaps
+        annual_rows = []
+        for year in sorted(year_reports.keys()):
+            if latest_annual and year <= int(latest_annual):
+                continue
+            species_data = year_reports[year].get(item["species_code"], {})
+            annual_val = species_data.get("annual")
+            if annual_val is not None:
+                annual_rows.append({
+                    "id_site": item["id_site"], "pollutant": item["pollutant"],
+                    "value": round(annual_val, 2),
+                    "year": year, "date": f"{year}-01-01", "averaging_period": "annual",
+                })
+        if annual_rows:
+            counts["annual"] = await sb_insert_rows(session, db_sem, "annual_averages", annual_rows, tag)
+            logger.info(f"{tag}: filled {counts['annual']} annual gap rows")
+
+        # Fill monthly gaps
+        monthly_rows = []
+        for year in sorted(year_reports.keys()):
+            species_data = year_reports[year].get(item["species_code"], {})
+            monthly_vals = species_data.get("monthly", {})
+            for mo in sorted(monthly_vals.keys()):
+                month_date = f"{year}-{mo:02d}-01"
+                if latest_monthly and month_date <= latest_monthly:
+                    continue
+                monthly_rows.append({
+                    "id_site": item["id_site"], "pollutant": item["pollutant"],
+                    "value": round(monthly_vals[mo], 2),
+                    "year": year, "month": mo,
+                    "date": month_date, "averaging_period": "monthly",
+                })
+        if monthly_rows:
+            counts["monthly"] = await sb_insert_rows(session, db_sem, "monthly_averages", monthly_rows, tag)
+            logger.info(f"{tag}: filled {counts['monthly']} monthly gap rows")
+
+
+async def _fill_aggregate_gaps_pg(
+    session: aiohttp.ClientSession, api_sem: asyncio.Semaphore,
+    pg_conn,
+    item: dict, tag: str, counts: dict,
+    report_cache: dict[tuple[str, int], dict],
+    latest_hourly: str,
+):
+    """Check and fill daily/monthly/annual gaps via direct Postgres when hourly is already up to date."""
+    earliest_year = item.get("start_year", 1996)
+    latest_daily = await asyncio.to_thread(pg_get_latest_agg, pg_conn, "daily_averages", item["id_site"], item["pollutant"], earliest_year)
+    latest_monthly = await asyncio.to_thread(pg_get_latest_agg, pg_conn, "monthly_averages", item["id_site"], item["pollutant"], earliest_year)
+    latest_annual = await asyncio.to_thread(pg_get_latest_agg, pg_conn, "annual_averages", item["id_site"], item["pollutant"], earliest_year)
+
+    current_year = datetime.now().year
+    start_year = item.get("start_year", current_year)
+    latest_hourly_year = int(latest_hourly[:4])
+
+    # Check if daily is behind hourly — log warning (recomputing daily from existing hourly is expensive)
+    if latest_daily:
+        daily_year = int(latest_daily[:4])
+        if daily_year < latest_hourly_year:
+            logger.info(f"{tag}: daily gap detected (daily={latest_daily}, hourly={latest_hourly}) — skipping (requires data re-fetch)")
+    elif latest_hourly:
+        logger.info(f"{tag}: no daily data exists — skipping (requires data re-fetch)")
+
+    # Check monthly/annual via MonitoringReport
+    annual_from = int(latest_annual) + 1 if latest_annual else start_year
+    monthly_from_year = int(latest_monthly[:4]) if latest_monthly else start_year
+    fetch_from = min(annual_from, monthly_from_year)
+
+    if fetch_from > current_year:
+        return  # nothing to fill
+
+    report_tasks = [
+        fetch_monitoring_report_async(session, api_sem, item["site_code"], y, report_cache)
+        for y in range(fetch_from, current_year + 1)
+    ]
+    report_results = await asyncio.gather(*report_tasks)
+    year_reports = {y: r for y, r in zip(range(fetch_from, current_year + 1), report_results)}
+
+    has_official_mean = any(
+        item["species_code"] in yr_data for yr_data in year_reports.values()
+    )
+
+    if has_official_mean:
+        # Fill annual gaps
+        annual_rows = []
+        for year in sorted(year_reports.keys()):
+            if latest_annual and year <= int(latest_annual):
+                continue
+            species_data = year_reports[year].get(item["species_code"], {})
+            annual_val = species_data.get("annual")
+            if annual_val is not None:
+                annual_rows.append({
+                    "id_site": item["id_site"], "pollutant": item["pollutant"],
+                    "value": round(annual_val, 2),
+                    "year": year, "date": f"{year}-01-01", "averaging_period": "annual",
+                })
+        if annual_rows:
+            counts["annual"] = await asyncio.to_thread(pg_insert_rows, pg_conn, "annual_averages", annual_rows, tag)
+            logger.info(f"{tag}: filled {counts['annual']} annual gap rows")
+
+        # Fill monthly gaps
+        monthly_rows = []
+        for year in sorted(year_reports.keys()):
+            species_data = year_reports[year].get(item["species_code"], {})
+            monthly_vals = species_data.get("monthly", {})
+            for mo in sorted(monthly_vals.keys()):
+                month_date = f"{year}-{mo:02d}-01"
+                if latest_monthly and month_date <= latest_monthly:
+                    continue
+                monthly_rows.append({
+                    "id_site": item["id_site"], "pollutant": item["pollutant"],
+                    "value": round(monthly_vals[mo], 2),
+                    "year": year, "month": mo,
+                    "date": month_date, "averaging_period": "monthly",
+                })
+        if monthly_rows:
+            counts["monthly"] = await asyncio.to_thread(pg_insert_rows, pg_conn, "monthly_averages", monthly_rows, tag)
+            logger.info(f"{tag}: filled {counts['monthly']} monthly gap rows")
+
+
 async def process_item_async(
     session: aiohttp.ClientSession,
     api_sem: asyncio.Semaphore,
@@ -684,8 +879,10 @@ async def process_item_async(
     tag = f"[{idx + 1}/{total}] {item['site_code']}/{item['pollutant']}"
     counts = {"hourly": 0, "daily": 0, "monthly": 0, "annual": 0}
 
+    earliest_year = item.get("start_year", 1996)
+
     # 1. Check latest existing hourly data (incremental)
-    latest_hourly = await sb_get_latest_hourly(session, db_sem, item["id_site"], item["pollutant"])
+    latest_hourly = await sb_get_latest_hourly(session, db_sem, item["id_site"], item["pollutant"], earliest_year)
 
     effective_start = item["start_date"]
     if latest_hourly:
@@ -693,7 +890,11 @@ async def process_item_async(
             latest_dt = datetime.strptime(latest_hourly, "%Y-%m-%d %H:%M:%S")
             incremental_start = (latest_dt + timedelta(hours=1)).strftime("%Y-%m-%d")
             if incremental_start > item["end_date"]:
-                logger.info(f"{tag}: up to date (latest: {latest_hourly})")
+                logger.info(f"{tag}: hourly up to date (latest: {latest_hourly})")
+                # Still check aggregate completeness
+                await _fill_aggregate_gaps_sb(
+                    session, api_sem, db_sem, item, tag, counts, report_cache, latest_hourly,
+                )
                 return counts
             effective_start = incremental_start
             logger.info(f"{tag}: incremental from {effective_start}")
@@ -770,7 +971,7 @@ async def process_item_async(
         dead_letter.append({"item": tag, "table": "hourly_averages", "failed_rows": len(hourly_rows) - counts["hourly"]})
 
     # 5. Daily averages (>= 18 hourly readings)
-    latest_daily = await sb_get_latest_agg(session, db_sem, "daily_averages", item["id_site"], item["pollutant"])
+    latest_daily = await sb_get_latest_agg(session, db_sem, "daily_averages", item["id_site"], item["pollutant"], earliest_year)
     daily_rows = []
     for day_key, vals in sorted(daily_bucket.items()):
         if latest_daily and day_key <= latest_daily:
@@ -788,8 +989,8 @@ async def process_item_async(
     # 6. Monthly & Annual averages
     # O3 has no Mean row in MonitoringReport — fall back to computing from hourly.
     # For NO2, PM10, PM25: use official ERG MonitoringReport values.
-    latest_monthly = await sb_get_latest_agg(session, db_sem, "monthly_averages", item["id_site"], item["pollutant"])
-    latest_annual = await sb_get_latest_agg(session, db_sem, "annual_averages", item["id_site"], item["pollutant"])
+    latest_monthly = await sb_get_latest_agg(session, db_sem, "monthly_averages", item["id_site"], item["pollutant"], earliest_year)
+    latest_annual = await sb_get_latest_agg(session, db_sem, "annual_averages", item["id_site"], item["pollutant"], earliest_year)
 
     current_year = datetime.now().year
     start_year = item.get("start_year", current_year)
@@ -880,7 +1081,7 @@ async def process_item_async(
 
 
 class ProgressTracker:
-    """Logs a periodic summary of task progress every `interval` seconds."""
+    """Logs a periodic summary of task progress with ETA and throughput."""
 
     def __init__(self, total: int, interval: float = 30):
         self.total = total
@@ -888,6 +1089,7 @@ class ProgressTracker:
         self.completed = 0
         self.active = 0
         self.errors = 0
+        self.rows = {"hourly": 0, "daily": 0, "monthly": 0, "annual": 0}
         self._start = time.monotonic()
         self._task: Optional[asyncio.Task] = None
 
@@ -902,14 +1104,31 @@ class ProgressTracker:
             except asyncio.CancelledError:
                 pass
 
+    def record_counts(self, counts: dict):
+        for key in ("hourly", "daily", "monthly", "annual"):
+            self.rows[key] += counts.get(key, 0)
+
     async def _loop(self):
         while True:
             await asyncio.sleep(self.interval)
             elapsed = time.monotonic() - self._start
-            mins, secs = divmod(int(elapsed), 60)
+            pct = (self.completed / self.total * 100) if self.total else 0
+            rate = self.completed / elapsed if elapsed > 0 else 0
+
+            if rate > 0 and self.completed < self.total:
+                eta_secs = int((self.total - self.completed) / rate)
+                eta_m, eta_s = divmod(eta_secs, 60)
+                eta_str = f"{eta_m}m{eta_s:02d}s"
+            else:
+                eta_str = "?"
+
             logger.info(
-                "[PROGRESS] %d/%d done | %d active | %d errors | elapsed %dm%02ds",
-                self.completed, self.total, self.active, self.errors, mins, secs,
+                "[PROGRESS] %d/%d (%.1f%%) | %.1f items/s | ETA %s | "
+                "%d active | %d errors | rows: h=%s d=%s m=%s a=%s",
+                self.completed, self.total, pct, rate, eta_str,
+                self.active, self.errors,
+                f"{self.rows['hourly']:,}", f"{self.rows['daily']:,}",
+                f"{self.rows['monthly']:,}", f"{self.rows['annual']:,}",
             )
 
     @property
@@ -936,9 +1155,21 @@ async def run_async_pipeline(items: list[dict]):
             async with task_sem:
                 progress.active += 1
                 try:
-                    result = await process_item_async(session, api_sem, db_sem, item, idx, len(items), dead_letter, report_cache)
+                    result = await asyncio.wait_for(
+                        process_item_async(session, api_sem, db_sem, item, idx, len(items), dead_letter, report_cache),
+                        timeout=ITEM_TIMEOUT,
+                    )
+                    if result:
+                        progress.record_counts(result)
                     progress.completed += 1
                     return result
+                except asyncio.TimeoutError:
+                    tag = f"{item['site_code']}/{item['pollutant']}"
+                    logger.error(f"TIMEOUT [{idx+1}/{len(items)}] {tag} after {ITEM_TIMEOUT}s")
+                    dead_letter.append({"item": tag, "error": f"timeout ({ITEM_TIMEOUT}s)"})
+                    progress.errors += 1
+                    progress.completed += 1
+                    return None
                 except Exception as e:
                     logger.exception("Error [{idx}/{total}] {site}/{poll}".format(
                         idx=idx + 1, total=len(items),
@@ -993,10 +1224,11 @@ PG_COLS = {
 }
 
 
-def pg_get_latest_hourly(conn, id_site: str, pollutant: str) -> Optional[str]:
-    """Find latest hourly record via direct Postgres (year-by-year scan)."""
+def pg_get_latest_hourly(conn, id_site: str, pollutant: str, earliest_year: int = 1996) -> Optional[str]:
+    """Find latest hourly record via direct Postgres (year-by-year scan, early exit after 3 misses)."""
     current_year = datetime.now().year
-    for year in range(current_year, current_year - 30, -1):
+    consecutive_misses = 0
+    for year in range(current_year, max(earliest_year - 1, current_year - 30), -1):
         row = conn.execute(
             "SELECT year, month, day, hour FROM hourly_averages "
             "WHERE id_site = %s AND pollutant = %s AND year = %s "
@@ -1005,14 +1237,18 @@ def pg_get_latest_hourly(conn, id_site: str, pollutant: str) -> Optional[str]:
         ).fetchone()
         if row:
             return f"{row[0]}-{row[1]:02d}-{row[2]:02d} {row[3]:02d}:00:00"
+        consecutive_misses += 1
+        if consecutive_misses >= EARLY_EXIT_MISSES:
+            break
     return None
 
 
-def pg_get_latest_agg(conn, table: str, id_site: str, pollutant: str) -> Optional[str]:
-    """Find latest aggregate record via year-by-year scan (avoids timeout on large tables)."""
+def pg_get_latest_agg(conn, table: str, id_site: str, pollutant: str, earliest_year: int = 1996) -> Optional[str]:
+    """Find latest aggregate record via year-by-year scan (early exit after 3 misses)."""
     current_year = datetime.now().year
+    consecutive_misses = 0
     if table == "annual_averages":
-        for year in range(current_year, current_year - 30, -1):
+        for year in range(current_year, max(earliest_year - 1, current_year - 30), -1):
             row = conn.execute(
                 "SELECT year FROM annual_averages "
                 "WHERE id_site = %s AND pollutant = %s AND year = %s "
@@ -1021,8 +1257,11 @@ def pg_get_latest_agg(conn, table: str, id_site: str, pollutant: str) -> Optiona
             ).fetchone()
             if row:
                 return str(row[0])
+            consecutive_misses += 1
+            if consecutive_misses >= EARLY_EXIT_MISSES:
+                break
     else:
-        for year in range(current_year, current_year - 30, -1):
+        for year in range(current_year, max(earliest_year - 1, current_year - 30), -1):
             row = conn.execute(
                 f"SELECT date FROM {table} "
                 f"WHERE id_site = %s AND pollutant = %s "
@@ -1032,23 +1271,37 @@ def pg_get_latest_agg(conn, table: str, id_site: str, pollutant: str) -> Optiona
             ).fetchone()
             if row:
                 return str(row[0])
+            consecutive_misses += 1
+            if consecutive_misses >= EARLY_EXIT_MISSES:
+                break
     return None
 
 
-def pg_insert_rows(conn, table: str, rows: list[dict], tag: str) -> int:
-    """Bulk insert using psycopg COPY protocol — fastest possible Postgres insert."""
+def pg_insert_rows(conn, table: str, rows: list[dict], tag: str, max_retries: int = 3) -> int:
+    """Bulk insert using psycopg COPY protocol with retry on transient failures."""
     if not rows:
         return 0
     cols = PG_COLS[table]
     inserted = 0
     for i in range(0, len(rows), PG_BATCH_SIZE):
         batch = rows[i:i + PG_BATCH_SIZE]
-        with conn.cursor() as cur:
-            with cur.copy(f"COPY {table} ({', '.join(cols)}) FROM STDIN") as copy:
-                for row in batch:
-                    copy.write_row(tuple(row[c] for c in cols))
-        conn.commit()
-        inserted += len(batch)
+        for attempt in range(max_retries):
+            try:
+                with conn.cursor() as cur:
+                    with cur.copy(f"COPY {table} ({', '.join(cols)}) FROM STDIN") as copy:
+                        for row in batch:
+                            copy.write_row(tuple(row[c] for c in cols))
+                conn.commit()
+                inserted += len(batch)
+                break
+            except Exception as e:
+                conn.rollback()
+                if attempt < max_retries - 1:
+                    logger.warning(f"{tag}: PG {table} COPY attempt {attempt+1} failed: {e}")
+                    time.sleep(2 ** attempt)
+                else:
+                    logger.error(f"{tag}: PG {table} COPY failed after {max_retries} retries: {e}")
+                    raise
     return inserted
 
 
@@ -1059,13 +1312,24 @@ async def process_item_backfill(
     item: dict, idx: int, total: int,
     dead_letter: list,
     report_cache: dict[tuple[str, int], dict],
+    latest_dates_cache: dict[tuple[str, str], str] | None = None,
 ) -> dict:
-    """Like process_item_async but writes via direct Postgres instead of REST API."""
+    """Like process_item_async but writes via direct Postgres instead of REST API.
+
+    All sync PG calls are wrapped with asyncio.to_thread() to avoid blocking the event loop.
+    """
     tag = f"[{idx + 1}/{total}] {item['site_code']}/{item['pollutant']}"
     counts = {"hourly": 0, "daily": 0, "monthly": 0, "annual": 0}
 
-    # 1. Check latest existing hourly data (incremental)
-    latest_hourly = pg_get_latest_hourly(pg_conn, item["id_site"], item["pollutant"])
+    # 1. Check latest existing hourly data (incremental) — use prefetch cache if available
+    cache_key = (item["id_site"], item["pollutant"])
+    if latest_dates_cache is not None and cache_key in latest_dates_cache:
+        latest_hourly = latest_dates_cache[cache_key]
+    else:
+        latest_hourly = await asyncio.to_thread(
+            pg_get_latest_hourly, pg_conn, item["id_site"], item["pollutant"],
+            item.get("start_year", 1996),
+        )
 
     effective_start = item["start_date"]
     if latest_hourly:
@@ -1073,7 +1337,11 @@ async def process_item_backfill(
             latest_dt = datetime.strptime(latest_hourly, "%Y-%m-%d %H:%M:%S")
             incremental_start = (latest_dt + timedelta(hours=1)).strftime("%Y-%m-%d")
             if incremental_start > item["end_date"]:
-                logger.info(f"{tag}: up to date (latest: {latest_hourly})")
+                logger.info(f"{tag}: hourly up to date (latest: {latest_hourly})")
+                # Still check aggregate completeness
+                await _fill_aggregate_gaps_pg(
+                    session, api_sem, pg_conn, item, tag, counts, report_cache, latest_hourly,
+                )
                 return counts
             effective_start = incremental_start
             logger.info(f"{tag}: incremental from {effective_start}")
@@ -1143,11 +1411,12 @@ async def process_item_backfill(
         logger.info(f"{tag}: no new records after filtering")
         return counts
 
-    # 4. Insert hourly data via COPY
-    counts["hourly"] = pg_insert_rows(pg_conn, "hourly_averages", hourly_rows, tag)
+    # 4. Insert hourly data via COPY (offloaded to thread)
+    counts["hourly"] = await asyncio.to_thread(pg_insert_rows, pg_conn, "hourly_averages", hourly_rows, tag)
 
     # 5. Daily averages (>= 18 hourly readings)
-    latest_daily = pg_get_latest_agg(pg_conn, "daily_averages", item["id_site"], item["pollutant"])
+    earliest_year = item.get("start_year", 1996)
+    latest_daily = await asyncio.to_thread(pg_get_latest_agg, pg_conn, "daily_averages", item["id_site"], item["pollutant"], earliest_year)
     daily_rows = []
     for day_key, vals in sorted(daily_bucket.items()):
         if latest_daily and day_key <= latest_daily:
@@ -1160,11 +1429,11 @@ async def process_item_backfill(
                 "year": int(y), "month": int(mo), "day": int(d),
                 "date": day_key, "averaging_period": "daily",
             })
-    counts["daily"] = pg_insert_rows(pg_conn, "daily_averages", daily_rows, tag)
+    counts["daily"] = await asyncio.to_thread(pg_insert_rows, pg_conn, "daily_averages", daily_rows, tag)
 
     # 6. Monthly & Annual averages (MonitoringReport for NO2/PM/PM25, hourly fallback for O3)
-    latest_monthly = pg_get_latest_agg(pg_conn, "monthly_averages", item["id_site"], item["pollutant"])
-    latest_annual = pg_get_latest_agg(pg_conn, "annual_averages", item["id_site"], item["pollutant"])
+    latest_monthly = await asyncio.to_thread(pg_get_latest_agg, pg_conn, "monthly_averages", item["id_site"], item["pollutant"], earliest_year)
+    latest_annual = await asyncio.to_thread(pg_get_latest_agg, pg_conn, "annual_averages", item["id_site"], item["pollutant"], earliest_year)
 
     current_year = datetime.now().year
     start_year = item.get("start_year", current_year)
@@ -1200,7 +1469,7 @@ async def process_item_backfill(
                     "value": round(annual_val, 2),
                     "year": year, "date": f"{year}-01-01", "averaging_period": "annual",
                 })
-        counts["annual"] = pg_insert_rows(pg_conn, "annual_averages", annual_rows, tag)
+        counts["annual"] = await asyncio.to_thread(pg_insert_rows, pg_conn, "annual_averages", annual_rows, tag)
 
         monthly_rows = []
         for year in sorted(year_reports.keys()):
@@ -1216,7 +1485,7 @@ async def process_item_backfill(
                     "year": year, "month": mo,
                     "date": month_date, "averaging_period": "monthly",
                 })
-        counts["monthly"] = pg_insert_rows(pg_conn, "monthly_averages", monthly_rows, tag)
+        counts["monthly"] = await asyncio.to_thread(pg_insert_rows, pg_conn, "monthly_averages", monthly_rows, tag)
     else:
         monthly_rows = []
         for month_key, vals in sorted(monthly_bucket.items()):
@@ -1230,7 +1499,7 @@ async def process_item_backfill(
                 "year": int(y), "month": int(mo),
                 "date": month_date, "averaging_period": "monthly",
             })
-        counts["monthly"] = pg_insert_rows(pg_conn, "monthly_averages", monthly_rows, tag)
+        counts["monthly"] = await asyncio.to_thread(pg_insert_rows, pg_conn, "monthly_averages", monthly_rows, tag)
 
         annual_rows = []
         for year, vals in sorted(annual_bucket.items()):
@@ -1244,15 +1513,71 @@ async def process_item_backfill(
                     "value": round(sum(vals) / len(vals), 2),
                     "year": year, "date": f"{year}-01-01", "averaging_period": "annual",
                 })
-        counts["annual"] = pg_insert_rows(pg_conn, "annual_averages", annual_rows, tag)
+        counts["annual"] = await asyncio.to_thread(pg_insert_rows, pg_conn, "annual_averages", annual_rows, tag)
 
     logger.info(f"{tag}: inserted h={counts['hourly']} d={counts['daily']} m={counts['monthly']} a={counts['annual']}")
     return counts
 
 
+def pg_prefetch_latest_dates(conn, items: list[dict]) -> dict[tuple[str, str], str]:
+    """Single query to get latest hourly year for all work items, then one detail query per match."""
+    if not items:
+        return {}
+    pairs = list({(item["id_site"], item["pollutant"]) for item in items})
+
+    try:
+        # Create temp table with the pairs we need
+        conn.execute("CREATE TEMP TABLE IF NOT EXISTS _prefetch_pairs (id_site TEXT, pollutant TEXT)")
+        conn.execute("TRUNCATE _prefetch_pairs")
+        with conn.cursor() as cur:
+            with cur.copy("COPY _prefetch_pairs (id_site, pollutant) FROM STDIN") as copy:
+                for s, p in pairs:
+                    copy.write_row((s, p))
+        conn.commit()
+
+        # Single query: max year per (id_site, pollutant)
+        rows = conn.execute("""
+            SELECT h.id_site, h.pollutant, MAX(h.year) as max_year
+            FROM hourly_averages h
+            INNER JOIN _prefetch_pairs p ON h.id_site = p.id_site AND h.pollutant = p.pollutant
+            GROUP BY h.id_site, h.pollutant
+        """).fetchall()
+    except Exception as e:
+        logger.warning(f"pg_prefetch_latest_dates failed, falling back to per-item: {e}")
+        conn.rollback()
+        return {}
+
+    # For each match, get the exact latest row in the max year
+    result = {}
+    for id_site, pollutant, max_year in rows:
+        try:
+            row = conn.execute(
+                "SELECT year, month, day, hour FROM hourly_averages "
+                "WHERE id_site = %s AND pollutant = %s AND year = %s "
+                "ORDER BY month DESC, day DESC, hour DESC LIMIT 1",
+                (id_site, pollutant, max_year),
+            ).fetchone()
+            if row:
+                result[(id_site, pollutant)] = f"{row[0]}-{row[1]:02d}-{row[2]:02d} {row[3]:02d}:00:00"
+        except Exception as e:
+            logger.debug(f"pg_prefetch_latest_dates detail failed for {id_site}/{pollutant}: {e}")
+            conn.rollback()
+
+    # Cleanup
+    try:
+        conn.execute("DROP TABLE IF EXISTS _prefetch_pairs")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+
+    logger.info(f"Prefetched latest dates for {len(result)}/{len(pairs)} sensor-pollutant pairs")
+    return result
+
+
 async def run_backfill_pipeline(items: list[dict]):
     """Fast backfill using direct Postgres COPY + async API fetches."""
     import psycopg
+    from psycopg_pool import ConnectionPool
 
     logger.info(f"Backfill mode: Direct Postgres | API={API_CONCURRENCY} PG={PG_CONCURRENCY} tasks={len(items)}")
 
@@ -1263,21 +1588,44 @@ async def run_backfill_pipeline(items: list[dict]):
     totals = {"hourly": 0, "daily": 0, "monthly": 0, "annual": 0, "errors": 0}
     progress = ProgressTracker(total=len(items))
 
-    connector = aiohttp.TCPConnector(limit=API_CONCURRENCY + 10, ttl_dns_cache=300)
-    timeout = aiohttp.ClientTimeout(total=120, connect=30)
+    # Connection pool: reuse connections instead of opening/closing per task
+    pool = ConnectionPool(DATABASE_URL, min_size=4, max_size=PG_CONCURRENCY, open=True,
+                          kwargs={"autocommit": False})
 
-    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+    # Batch-prefetch latest hourly dates to avoid per-item year-scan
+    prefetch_conn = psycopg.connect(DATABASE_URL, autocommit=False)
+    try:
+        latest_dates_cache = await asyncio.to_thread(pg_prefetch_latest_dates, prefetch_conn, items)
+    finally:
+        prefetch_conn.close()
+
+    connector = aiohttp.TCPConnector(limit=API_CONCURRENCY + 10, ttl_dns_cache=300)
+    http_timeout = aiohttp.ClientTimeout(total=120, connect=30)
+
+    async with aiohttp.ClientSession(connector=connector, timeout=http_timeout) as session:
         async def bounded_task(idx: int, item: dict):
             async with task_sem:
                 progress.active += 1
-                # Each task gets its own Postgres connection (thread-safe COPY)
-                pg_conn = psycopg.connect(DATABASE_URL, autocommit=False)
+                pg_conn = await asyncio.to_thread(pool.getconn)
                 try:
-                    result = await process_item_backfill(
-                        session, api_sem, pg_conn, item, idx, len(items), dead_letter, report_cache,
+                    result = await asyncio.wait_for(
+                        process_item_backfill(
+                            session, api_sem, pg_conn, item, idx, len(items),
+                            dead_letter, report_cache, latest_dates_cache,
+                        ),
+                        timeout=ITEM_TIMEOUT,
                     )
+                    if result:
+                        progress.record_counts(result)
                     progress.completed += 1
                     return result
+                except asyncio.TimeoutError:
+                    tag = f"{item['site_code']}/{item['pollutant']}"
+                    logger.error(f"TIMEOUT [{idx+1}/{len(items)}] {tag} after {ITEM_TIMEOUT}s")
+                    dead_letter.append({"item": tag, "error": f"timeout ({ITEM_TIMEOUT}s)"})
+                    progress.errors += 1
+                    progress.completed += 1
+                    return None
                 except Exception as e:
                     logger.exception("Error [{idx}/{total}] {site}/{poll}".format(
                         idx=idx + 1, total=len(items),
@@ -1288,13 +1636,15 @@ async def run_backfill_pipeline(items: list[dict]):
                     progress.completed += 1
                     return None
                 finally:
-                    pg_conn.close()
+                    await asyncio.to_thread(pool.putconn, pg_conn)
                     progress.active -= 1
 
         progress.start()
         tasks = [bounded_task(i, item) for i, item in enumerate(items)]
         results = await asyncio.gather(*tasks)
         await progress.stop()
+
+    pool.close()
 
     for result in results:
         if result:
