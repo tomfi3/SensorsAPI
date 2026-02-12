@@ -82,6 +82,10 @@ def setup_logging() -> logging.Logger:
     ))
     root.addHandler(file_handler)
 
+    # Silence noisy third-party loggers (httpcore, hpack, httpx, h2, urllib3)
+    for noisy in ("httpcore", "hpack", "h2", "httpx", "urllib3", "charset_normalizer"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
     return logging.getLogger(__name__)
 
 
