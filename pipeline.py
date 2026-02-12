@@ -712,6 +712,7 @@ async def _fill_aggregate_gaps_sb(
     latest_hourly: str,
 ):
     """Check and fill daily/monthly/annual gaps via Supabase REST when hourly is already up to date."""
+    logger.debug(f"{tag}: checking aggregate completeness (hourly up to date)")
     earliest_year = item.get("start_year", 1996)
     latest_daily = await sb_get_latest_agg(session, db_sem, "daily_averages", item["id_site"], item["pollutant"], earliest_year)
     latest_monthly = await sb_get_latest_agg(session, db_sem, "monthly_averages", item["id_site"], item["pollutant"], earliest_year)
@@ -721,13 +722,13 @@ async def _fill_aggregate_gaps_sb(
     start_year = item.get("start_year", current_year)
     latest_hourly_year = int(latest_hourly[:4])
 
-    # Check if daily is behind hourly — log warning (recomputing daily from REST is too expensive)
+    # Check if daily is behind hourly (recomputing daily from REST is too expensive — just log)
     if latest_daily:
         daily_year = int(latest_daily[:4])
         if daily_year < latest_hourly_year:
-            logger.info(f"{tag}: daily gap detected (daily={latest_daily}, hourly={latest_hourly}) — skipping (requires data re-fetch)")
-    elif latest_hourly:
-        logger.info(f"{tag}: no daily data exists — skipping (requires data re-fetch)")
+            logger.debug(f"{tag}: daily gap (daily={latest_daily}, hourly={latest_hourly}) — skipping (requires data re-fetch)")
+    else:
+        logger.debug(f"{tag}: no daily data — skipping (requires data re-fetch)")
 
     # Check monthly/annual via MonitoringReport
     annual_from = int(latest_annual) + 1 if latest_annual else start_year
@@ -735,8 +736,10 @@ async def _fill_aggregate_gaps_sb(
     fetch_from = min(annual_from, monthly_from_year)
 
     if fetch_from > current_year:
-        return  # nothing to fill
+        logger.debug(f"{tag}: aggregates up to date")
+        return
 
+    logger.info(f"{tag}: checking aggregate gaps (monthly/annual from {fetch_from})")
     report_tasks = [
         fetch_monitoring_report_async(session, api_sem, item["site_code"], y, report_cache)
         for y in range(fetch_from, current_year + 1)
@@ -748,42 +751,45 @@ async def _fill_aggregate_gaps_sb(
         item["species_code"] in yr_data for yr_data in year_reports.values()
     )
 
-    if has_official_mean:
-        # Fill annual gaps
-        annual_rows = []
-        for year in sorted(year_reports.keys()):
-            if latest_annual and year <= int(latest_annual):
-                continue
-            species_data = year_reports[year].get(item["species_code"], {})
-            annual_val = species_data.get("annual")
-            if annual_val is not None:
-                annual_rows.append({
-                    "id_site": item["id_site"], "pollutant": item["pollutant"],
-                    "value": round(annual_val, 2),
-                    "year": year, "date": f"{year}-01-01", "averaging_period": "annual",
-                })
-        if annual_rows:
-            counts["annual"] = await sb_insert_rows(session, db_sem, "annual_averages", annual_rows, tag)
-            logger.info(f"{tag}: filled {counts['annual']} annual gap rows")
+    if not has_official_mean:
+        logger.debug(f"{tag}: no official mean in MonitoringReport — skipping aggregate gap fill")
+        return
 
-        # Fill monthly gaps
-        monthly_rows = []
-        for year in sorted(year_reports.keys()):
-            species_data = year_reports[year].get(item["species_code"], {})
-            monthly_vals = species_data.get("monthly", {})
-            for mo in sorted(monthly_vals.keys()):
-                month_date = f"{year}-{mo:02d}-01"
-                if latest_monthly and month_date <= latest_monthly:
-                    continue
-                monthly_rows.append({
-                    "id_site": item["id_site"], "pollutant": item["pollutant"],
-                    "value": round(monthly_vals[mo], 2),
-                    "year": year, "month": mo,
-                    "date": month_date, "averaging_period": "monthly",
-                })
-        if monthly_rows:
-            counts["monthly"] = await sb_insert_rows(session, db_sem, "monthly_averages", monthly_rows, tag)
-            logger.info(f"{tag}: filled {counts['monthly']} monthly gap rows")
+    # Fill annual gaps
+    annual_rows = []
+    for year in sorted(year_reports.keys()):
+        if latest_annual and year <= int(latest_annual):
+            continue
+        species_data = year_reports[year].get(item["species_code"], {})
+        annual_val = species_data.get("annual")
+        if annual_val is not None:
+            annual_rows.append({
+                "id_site": item["id_site"], "pollutant": item["pollutant"],
+                "value": round(annual_val, 2),
+                "year": year, "date": f"{year}-01-01", "averaging_period": "annual",
+            })
+    if annual_rows:
+        counts["annual"] = await sb_insert_rows(session, db_sem, "annual_averages", annual_rows, tag)
+        logger.info(f"{tag}: filled {counts['annual']} annual gap rows")
+
+    # Fill monthly gaps
+    monthly_rows = []
+    for year in sorted(year_reports.keys()):
+        species_data = year_reports[year].get(item["species_code"], {})
+        monthly_vals = species_data.get("monthly", {})
+        for mo in sorted(monthly_vals.keys()):
+            month_date = f"{year}-{mo:02d}-01"
+            if latest_monthly and month_date <= latest_monthly:
+                continue
+            monthly_rows.append({
+                "id_site": item["id_site"], "pollutant": item["pollutant"],
+                "value": round(monthly_vals[mo], 2),
+                "year": year, "month": mo,
+                "date": month_date, "averaging_period": "monthly",
+            })
+    if monthly_rows:
+        counts["monthly"] = await sb_insert_rows(session, db_sem, "monthly_averages", monthly_rows, tag)
+        logger.info(f"{tag}: filled {counts['monthly']} monthly gap rows")
 
 
 async def _fill_aggregate_gaps_pg(
@@ -794,6 +800,7 @@ async def _fill_aggregate_gaps_pg(
     latest_hourly: str,
 ):
     """Check and fill daily/monthly/annual gaps via direct Postgres when hourly is already up to date."""
+    logger.debug(f"{tag}: checking aggregate completeness (hourly up to date)")
     earliest_year = item.get("start_year", 1996)
     latest_daily = await asyncio.to_thread(pg_get_latest_agg, pg_conn, "daily_averages", item["id_site"], item["pollutant"], earliest_year)
     latest_monthly = await asyncio.to_thread(pg_get_latest_agg, pg_conn, "monthly_averages", item["id_site"], item["pollutant"], earliest_year)
@@ -803,13 +810,13 @@ async def _fill_aggregate_gaps_pg(
     start_year = item.get("start_year", current_year)
     latest_hourly_year = int(latest_hourly[:4])
 
-    # Check if daily is behind hourly — log warning (recomputing daily from existing hourly is expensive)
+    # Check if daily is behind hourly (recomputing daily from existing hourly is expensive — just log)
     if latest_daily:
         daily_year = int(latest_daily[:4])
         if daily_year < latest_hourly_year:
-            logger.info(f"{tag}: daily gap detected (daily={latest_daily}, hourly={latest_hourly}) — skipping (requires data re-fetch)")
-    elif latest_hourly:
-        logger.info(f"{tag}: no daily data exists — skipping (requires data re-fetch)")
+            logger.debug(f"{tag}: daily gap (daily={latest_daily}, hourly={latest_hourly}) — skipping (requires data re-fetch)")
+    else:
+        logger.debug(f"{tag}: no daily data — skipping (requires data re-fetch)")
 
     # Check monthly/annual via MonitoringReport
     annual_from = int(latest_annual) + 1 if latest_annual else start_year
@@ -817,8 +824,10 @@ async def _fill_aggregate_gaps_pg(
     fetch_from = min(annual_from, monthly_from_year)
 
     if fetch_from > current_year:
-        return  # nothing to fill
+        logger.debug(f"{tag}: aggregates up to date")
+        return
 
+    logger.info(f"{tag}: checking aggregate gaps (monthly/annual from {fetch_from})")
     report_tasks = [
         fetch_monitoring_report_async(session, api_sem, item["site_code"], y, report_cache)
         for y in range(fetch_from, current_year + 1)
@@ -830,42 +839,45 @@ async def _fill_aggregate_gaps_pg(
         item["species_code"] in yr_data for yr_data in year_reports.values()
     )
 
-    if has_official_mean:
-        # Fill annual gaps
-        annual_rows = []
-        for year in sorted(year_reports.keys()):
-            if latest_annual and year <= int(latest_annual):
-                continue
-            species_data = year_reports[year].get(item["species_code"], {})
-            annual_val = species_data.get("annual")
-            if annual_val is not None:
-                annual_rows.append({
-                    "id_site": item["id_site"], "pollutant": item["pollutant"],
-                    "value": round(annual_val, 2),
-                    "year": year, "date": f"{year}-01-01", "averaging_period": "annual",
-                })
-        if annual_rows:
-            counts["annual"] = await asyncio.to_thread(pg_insert_rows, pg_conn, "annual_averages", annual_rows, tag)
-            logger.info(f"{tag}: filled {counts['annual']} annual gap rows")
+    if not has_official_mean:
+        logger.debug(f"{tag}: no official mean in MonitoringReport — skipping aggregate gap fill")
+        return
 
-        # Fill monthly gaps
-        monthly_rows = []
-        for year in sorted(year_reports.keys()):
-            species_data = year_reports[year].get(item["species_code"], {})
-            monthly_vals = species_data.get("monthly", {})
-            for mo in sorted(monthly_vals.keys()):
-                month_date = f"{year}-{mo:02d}-01"
-                if latest_monthly and month_date <= latest_monthly:
-                    continue
-                monthly_rows.append({
-                    "id_site": item["id_site"], "pollutant": item["pollutant"],
-                    "value": round(monthly_vals[mo], 2),
-                    "year": year, "month": mo,
-                    "date": month_date, "averaging_period": "monthly",
-                })
-        if monthly_rows:
-            counts["monthly"] = await asyncio.to_thread(pg_insert_rows, pg_conn, "monthly_averages", monthly_rows, tag)
-            logger.info(f"{tag}: filled {counts['monthly']} monthly gap rows")
+    # Fill annual gaps
+    annual_rows = []
+    for year in sorted(year_reports.keys()):
+        if latest_annual and year <= int(latest_annual):
+            continue
+        species_data = year_reports[year].get(item["species_code"], {})
+        annual_val = species_data.get("annual")
+        if annual_val is not None:
+            annual_rows.append({
+                "id_site": item["id_site"], "pollutant": item["pollutant"],
+                "value": round(annual_val, 2),
+                "year": year, "date": f"{year}-01-01", "averaging_period": "annual",
+            })
+    if annual_rows:
+        counts["annual"] = await asyncio.to_thread(pg_insert_rows, pg_conn, "annual_averages", annual_rows, tag)
+        logger.info(f"{tag}: filled {counts['annual']} annual gap rows")
+
+    # Fill monthly gaps
+    monthly_rows = []
+    for year in sorted(year_reports.keys()):
+        species_data = year_reports[year].get(item["species_code"], {})
+        monthly_vals = species_data.get("monthly", {})
+        for mo in sorted(monthly_vals.keys()):
+            month_date = f"{year}-{mo:02d}-01"
+            if latest_monthly and month_date <= latest_monthly:
+                continue
+            monthly_rows.append({
+                "id_site": item["id_site"], "pollutant": item["pollutant"],
+                "value": round(monthly_vals[mo], 2),
+                "year": year, "month": mo,
+                "date": month_date, "averaging_period": "monthly",
+            })
+    if monthly_rows:
+        counts["monthly"] = await asyncio.to_thread(pg_insert_rows, pg_conn, "monthly_averages", monthly_rows, tag)
+        logger.info(f"{tag}: filled {counts['monthly']} monthly gap rows")
 
 
 async def process_item_async(
@@ -1325,11 +1337,13 @@ async def process_item_backfill(
     cache_key = (item["id_site"], item["pollutant"])
     if latest_dates_cache is not None and cache_key in latest_dates_cache:
         latest_hourly = latest_dates_cache[cache_key]
+        logger.debug(f"{tag}: prefetch cache hit — latest={latest_hourly}")
     else:
         latest_hourly = await asyncio.to_thread(
             pg_get_latest_hourly, pg_conn, item["id_site"], item["pollutant"],
             item.get("start_year", 1996),
         )
+        logger.debug(f"{tag}: prefetch cache miss — queried latest={latest_hourly}")
 
     effective_start = item["start_date"]
     if latest_hourly:
@@ -1589,15 +1603,18 @@ async def run_backfill_pipeline(items: list[dict]):
     progress = ProgressTracker(total=len(items))
 
     # Connection pool: reuse connections instead of opening/closing per task
+    logger.info(f"Creating PG connection pool (min=4, max={PG_CONCURRENCY})")
     pool = ConnectionPool(DATABASE_URL, min_size=4, max_size=PG_CONCURRENCY, open=True,
                           kwargs={"autocommit": False})
 
     # Batch-prefetch latest hourly dates to avoid per-item year-scan
+    logger.info("Prefetching latest hourly dates for all work items...")
     prefetch_conn = psycopg.connect(DATABASE_URL, autocommit=False)
     try:
         latest_dates_cache = await asyncio.to_thread(pg_prefetch_latest_dates, prefetch_conn, items)
     finally:
         prefetch_conn.close()
+    logger.info(f"Prefetch complete: {len(latest_dates_cache)} items have existing data")
 
     connector = aiohttp.TCPConnector(limit=API_CONCURRENCY + 10, ttl_dns_cache=300)
     http_timeout = aiohttp.ClientTimeout(total=120, connect=30)
