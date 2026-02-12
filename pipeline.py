@@ -1612,13 +1612,23 @@ async def run_backfill_pipeline(items: list[dict]):
                           kwargs={"autocommit": False})
 
     # Batch-prefetch latest hourly dates to avoid per-item year-scan
-    logger.info("Prefetching latest hourly dates for all work items...")
+    # Falls back to empty cache (per-item queries) if prefetch takes too long
+    PREFETCH_TIMEOUT = int(os.environ.get("PREFETCH_TIMEOUT", "30"))
+    logger.info(f"Prefetching latest hourly dates (timeout={PREFETCH_TIMEOUT}s)...")
+    latest_dates_cache: dict[tuple[str, str], str] = {}
     prefetch_conn = psycopg.connect(DATABASE_URL, autocommit=False)
     try:
-        latest_dates_cache = await asyncio.to_thread(pg_prefetch_latest_dates, prefetch_conn, items)
+        latest_dates_cache = await asyncio.wait_for(
+            asyncio.to_thread(pg_prefetch_latest_dates, prefetch_conn, items),
+            timeout=PREFETCH_TIMEOUT,
+        )
+        logger.info(f"Prefetch complete: {len(latest_dates_cache)} items have existing data")
+    except asyncio.TimeoutError:
+        logger.warning(f"Prefetch timed out after {PREFETCH_TIMEOUT}s — falling back to per-item queries")
+    except Exception as e:
+        logger.warning(f"Prefetch failed: {e} — falling back to per-item queries")
     finally:
         prefetch_conn.close()
-    logger.info(f"Prefetch complete: {len(latest_dates_cache)} items have existing data")
 
     connector = aiohttp.TCPConnector(limit=API_CONCURRENCY + 10, ttl_dns_cache=300)
     http_timeout = aiohttp.ClientTimeout(total=120, connect=30)
